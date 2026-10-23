@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# SUNDAY local data (memory, file index, tokens)
+/.sunday-data/
+!.env.example
+
+# Vosk wake-word model (40 MB)
+/public/wake/*.tar.gz

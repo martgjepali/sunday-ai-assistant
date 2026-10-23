@@ -2,24 +2,39 @@
   "name": "sunday_ai_assistant",
   "version": "0.1.0",
   "private": true,
+  "description": "SUNDAY — personal AI operating system",
+  "main": "electron/main.cjs",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -H 127.0.0.1 -p 3210",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -H 127.0.0.1 -p 3210",
+    "desktop": "electron .",
+    "desktop:dev": "electron . --dev",
     "lint": "eslint"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.1.0",
+    "@elevenlabs/elevenlabs-js": "^2.74.0",
+    "3d-force-graph": "^1.80.1",
+    "dotenv": "^18.0.9",
     "next": "16.4.2",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "three": "^0.186.1",
+    "three-spritetext": "^1.10.0",
+    "vosk-browser": "^0.0.8",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",
-    "@types/node": "^20",
+    "@types/node": "^25.9.9",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/three": "^0.186.0",
+    "electron": "^45.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.4.2",
+    "server-only": "^0.0.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
