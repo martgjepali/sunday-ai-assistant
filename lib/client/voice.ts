@@ -263,9 +263,57 @@ function pickFemaleVoice(): SpeechSynthesisVoice | undefined {
 
 export type EarHooks = {
   onInterim: (text: string) => void;
-  onUtterance: (text: string) => void;
+  /** `audio` is the utterance as 16 kHz mono 16-bit PCM, for Voice ID (when available). */
+  onUtterance: (text: string, audio?: Int16Array) => void;
   onError: (msg: string) => void;
 };
+
+/**
+ * Keeps the last 30 s of microphone audio as 16 kHz mono samples, so an
+ * utterance can be cut out by time and checked against sir's voiceprint.
+ */
+export class PcmTap {
+  static readonly RATE = 16_000;
+  private ctx: AudioContext;
+  private node: ScriptProcessorNode;
+  private ring = new Float32Array(PcmTap.RATE * 30);
+  /** Total samples captured since the tap started. */
+  captured = 0;
+
+  constructor(stream: MediaStream) {
+    this.ctx = new AudioContext({ sampleRate: PcmTap.RATE });
+    this.node = this.ctx.createScriptProcessor(2048, 1, 1);
+    this.node.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      for (let i = 0; i < input.length; i++) this.ring[(this.captured + i) % this.ring.length] = input[i];
+      this.captured += input.length;
+    };
+    this.ctx.createMediaStreamSource(stream).connect(this.node);
+    this.node.connect(this.ctx.destination); // required for onaudioprocess to fire; outputs silence
+  }
+
+  /** Samples [from, to) by absolute index, as 16-bit PCM (clamped to what's still buffered). */
+  slice(from: number, to: number): Int16Array {
+    const end = Math.min(to, this.captured);
+    const start = Math.max(from, end - this.ring.length, 0);
+    const out = new Int16Array(Math.max(0, end - start));
+    for (let i = 0; i < out.length; i++) {
+      const v = this.ring[(start + i) % this.ring.length];
+      out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+    }
+    return out;
+  }
+
+  /** The most recent `seconds` of audio. */
+  last(seconds: number) {
+    return this.slice(this.captured - Math.round(seconds * PcmTap.RATE), this.captured);
+  }
+
+  close() {
+    this.node.disconnect();
+    void this.ctx.close();
+  }
+}
 
 export interface Ear {
   start(): Promise<void>;
@@ -305,7 +353,12 @@ export class DeepgramEar implements Ear {
   private recorder: MediaRecorder | null = null;
   private stream: MediaStream | null = null;
   private meter: MicMeter | null = null;
+  private tap: PcmTap | null = null;
+  /** Tap position when audio started flowing to Deepgram (Deepgram's time zero). */
+  private tapZero = 0;
   private finals: string[] = [];
+  /** Deepgram time span (seconds) of the utterance being assembled. */
+  private span: { start: number; end: number } | null = null;
 
   constructor(private hooks: EarHooks) {}
 
@@ -320,6 +373,7 @@ export class DeepgramEar implements Ear {
     const { scheme, token } = (await res.json()) as { scheme: string; token: string };
     this.stream = await openMic();
     this.meter = new MicMeter(this.stream);
+    this.tap = new PcmTap(this.stream);
 
     const params = new URLSearchParams({
       model: "nova-3",
@@ -342,18 +396,26 @@ export class DeepgramEar implements Ear {
         if (e.data.size && ws.readyState === WebSocket.OPEN) ws.send(e.data);
       };
       this.recorder.start(200);
+      this.tapZero = this.tap?.captured ?? 0;
     };
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data as string) as {
         type: string;
         is_final?: boolean;
         speech_final?: boolean;
+        start?: number;
+        duration?: number;
         channel?: { alternatives: { transcript: string }[] };
       };
       if (msg.type === "Results") {
         const text = msg.channel?.alternatives[0]?.transcript ?? "";
         if (msg.is_final) {
-          if (text) this.finals.push(text);
+          if (text) {
+            this.finals.push(text);
+            const start = msg.start ?? 0;
+            const end = start + (msg.duration ?? 0);
+            this.span = this.span ? { start: this.span.start, end } : { start, end };
+          }
           if (msg.speech_final) this.commit();
           else if (this.finals.length) this.hooks.onInterim(this.finals.join(" "));
         } else if (text) {
@@ -371,8 +433,17 @@ export class DeepgramEar implements Ear {
 
   private commit() {
     const text = this.finals.join(" ").trim();
+    const span = this.span;
     this.finals = [];
-    if (text) this.hooks.onUtterance(text);
+    this.span = null;
+    if (!text) return;
+    // Cut the utterance out of the tap by Deepgram's timings (with a little padding).
+    const rate = PcmTap.RATE;
+    const audio =
+      this.tap && span
+        ? this.tap.slice(this.tapZero + Math.floor((span.start - 0.25) * rate), this.tapZero + Math.ceil((span.end + 0.25) * rate))
+        : undefined;
+    this.hooks.onUtterance(text, audio);
   }
 
   stop() {
@@ -392,7 +463,10 @@ export class DeepgramEar implements Ear {
     this.stream = null;
     this.meter?.close();
     this.meter = null;
+    this.tap?.close();
+    this.tap = null;
     this.finals = [];
+    this.span = null;
   }
 }
 

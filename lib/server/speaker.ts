@@ -1,0 +1,170 @@
+import "server-only";
+import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { SpeakerEmbeddingExtractor } from "sherpa-onnx-node";
+import { kvGet, kvSet, logActivity } from "./db";
+
+/**
+ * Voice ID: SUNDAY recognises sir by voice, fully offline. Each utterance is
+ * turned into a 256-number voiceprint by the WeSpeaker ResNet34 model and
+ * compared with the voiceprint captured at enrollment. The enrolled voiceprint
+ * never leaves this server process.
+ */
+
+const MODEL = path.join(
+  /* turbopackIgnore: true */ process.cwd(),
+  "models",
+  "speaker",
+  "wespeaker_en_voxceleb_resnet34.onnx",
+);
+export const SAMPLE_RATE = 16_000;
+/** Cosine similarity at or above which a voice counts as sir's. */
+const THRESHOLD = Number(process.env.SUNDAY_VOICE_THRESHOLD ?? 0.6);
+/** Voice tokens let one verified utterance through /api/chat. */
+const TOKEN_TTL_MS = 2 * 60 * 1000;
+/** Typed messages are allowed this long after sir's voice was last recognised. */
+const TEXT_GRACE_MS = 10 * 60 * 1000;
+
+type OwnerVoice = { embeddings: number[][]; centroid: number[]; enrolledAt: number };
+
+const g = globalThis as unknown as {
+  __sundaySpeaker?: {
+    extractor: SpeakerEmbeddingExtractor | null;
+    pending: number[][];
+    tokens: Map<string, number>;
+    ownerHeardAt: number;
+  };
+};
+g.__sundaySpeaker ??= { extractor: null, pending: [], tokens: new Map(), ownerHeardAt: 0 };
+const state = g.__sundaySpeaker;
+
+export const voiceIdDisabled = () => process.env.SUNDAY_VOICE_ID === "off";
+export const modelAvailable = () => existsSync(MODEL);
+
+function extractor() {
+  if (!state.extractor) {
+    if (!modelAvailable()) throw new Error("Speaker model missing (models/speaker/wespeaker_en_voxceleb_resnet34.onnx).");
+    state.extractor = new SpeakerEmbeddingExtractor({ model: MODEL, numThreads: 2, debug: false, provider: "cpu" });
+  }
+  return state.extractor;
+}
+
+/** 16-bit little-endian mono PCM at 16 kHz → Float32 samples. */
+export function pcmToFloat(buf: ArrayBuffer): Float32Array {
+  const ints = new Int16Array(buf, 0, Math.floor(buf.byteLength / 2));
+  const out = new Float32Array(ints.length);
+  for (let i = 0; i < ints.length; i++) out[i] = ints[i] / 32768;
+  return out;
+}
+
+function rms(samples: Float32Array) {
+  let s = 0;
+  for (const v of samples) s += v * v;
+  return Math.sqrt(s / Math.max(1, samples.length));
+}
+
+const cosine = (a: ArrayLike<number>, b: ArrayLike<number>) => {
+  let d = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    d += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return d / Math.sqrt(na * nb || 1);
+};
+
+export type ClipProblem = "too-short" | "too-quiet";
+
+/** Voiceprint of one clip, or why it can't be used. */
+export function embed(samples: Float32Array): { embedding: number[] } | { problem: ClipProblem } {
+  if (samples.length < SAMPLE_RATE * 0.8) return { problem: "too-short" };
+  if (rms(samples) < 0.004) return { problem: "too-quiet" };
+  const ex = extractor();
+  const stream = ex.createStream();
+  stream.acceptWaveform({ samples, sampleRate: SAMPLE_RATE });
+  stream.inputFinished();
+  return { embedding: Array.from(ex.compute(stream)) };
+}
+
+export function ownerVoice(): OwnerVoice | null {
+  if (voiceIdDisabled()) return null;
+  const v = kvGet<OwnerVoice>("owner_voice");
+  return v?.embeddings?.length ? v : null;
+}
+
+/** Is this clip sir? On success, returns a single-use token for /api/chat. */
+export function verify(samples: Float32Array) {
+  const owner = ownerVoice();
+  if (!owner) return { enrolled: false as const, owner: true, token: null, similarity: null };
+  const result = embed(samples);
+  if ("problem" in result) return { enrolled: true as const, owner: false, problem: result.problem, token: null, similarity: null };
+  // Compare with the averaged voiceprint only: taking the best of several samples
+  // gives strangers extra chances to score high.
+  const similarity = cosine(result.embedding, owner.centroid);
+  const isOwner = similarity >= THRESHOLD;
+  let token: string | null = null;
+  if (isOwner) {
+    state.ownerHeardAt = Date.now();
+    token = randomBytes(16).toString("hex");
+    state.tokens.set(token, Date.now() + TOKEN_TTL_MS);
+  } else {
+    logActivity("security", "Voice not recognised", similarity.toFixed(2));
+  }
+  return { enrolled: true as const, owner: isOwner, similarity: Math.round(similarity * 100) / 100, token };
+}
+
+/**
+ * Gate for /api/chat. Voice requests need a fresh single-use token from
+ * verify(); typed requests need sir's voice to have been heard recently.
+ */
+export function allowChat(mode: "voice" | "text", token?: string | null): boolean {
+  if (!ownerVoice()) return true;
+  const now = Date.now();
+  for (const [t, exp] of state.tokens) if (exp < now) state.tokens.delete(t);
+  if (token && state.tokens.has(token)) {
+    state.tokens.delete(token);
+    return true;
+  }
+  return mode === "text" && now - state.ownerHeardAt < TEXT_GRACE_MS;
+}
+
+export const ownerRecentlyHeard = (withinMs = 5 * 60 * 1000) => Date.now() - state.ownerHeardAt < withinMs;
+
+/* ───────── Enrollment ───────── */
+
+export function enrollReset() {
+  state.pending = [];
+}
+
+export function enrollAdd(samples: Float32Array) {
+  const result = embed(samples);
+  if ("problem" in result) return { ok: false as const, problem: result.problem, count: state.pending.length };
+  state.pending.push(result.embedding);
+  return { ok: true as const, count: state.pending.length };
+}
+
+export function enrollSave() {
+  const samples = state.pending;
+  if (samples.length < 4) return { ok: false as const, error: "Need at least 4 recordings." };
+  const dim = samples[0].length;
+  const centroid = Array.from({ length: dim }, (_, i) => samples.reduce((s, e) => s + e[i], 0) / samples.length);
+  const consistency = samples.map((e) => cosine(e, centroid));
+  // Every recording should sound like the same person.
+  if (Math.min(...consistency) < THRESHOLD) {
+    state.pending = [];
+    return { ok: false as const, error: "The recordings didn't sound like the same voice. Let's try again in a quieter spot." };
+  }
+  kvSet("owner_voice", { embeddings: samples, centroid, enrolledAt: Date.now() } satisfies OwnerVoice);
+  state.pending = [];
+  state.ownerHeardAt = Date.now();
+  logActivity("security", "Voice ID enrolled");
+  return { ok: true as const, consistency: Math.round(Math.min(...consistency) * 100) / 100 };
+}
+
+export function enrollRemove() {
+  kvSet("owner_voice", { embeddings: [], centroid: [], enrolledAt: 0 } satisfies OwnerVoice);
+  logActivity("security", "Voice ID removed");
+}

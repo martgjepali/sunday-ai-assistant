@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, getJSON, streamChat, type SystemStatus } from "./api";
+import { NotOwnerError, api, getJSON, streamChat, verifyVoice, type SystemStatus } from "./api";
 import { BrowserEar, DeepgramEar, Speaker, WakeWord, chime, type Ear } from "./voice";
 
 export type VoiceState = "standby" | "listening" | "thinking" | "speaking";
@@ -21,6 +21,8 @@ declare global {
     sundayDesktop?: {
       isDesktop: true;
       onSummon(cb: () => void): () => void;
+      onLock?(cb: () => void): () => void;
+      onUnlock?(cb: () => void): () => void;
       minimize(): void;
       toggleFullscreen(): void;
       hide(): void;
@@ -34,6 +36,8 @@ const IDLE_MS = 30_000;
 /** Words that always mean "stop" — react instantly, no need to ask Jev. */
 const HARD_STOP = /\b(stop|wait|hold on|cancel|pause|shut up|be quiet|enough)\b/i;
 const INTERRUPT_THRESHOLD = 0.5;
+export type IdentityState = "off" | "ready" | "owner" | "denied";
+
 const words = (s: string) => s.trim().split(/\s+/).filter(Boolean).length;
 const uid = () => Math.random().toString(36).slice(2, 10);
 
@@ -60,8 +64,62 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
   const earRef = useRef<Ear | null>(null);
   const wakeRef = useRef<WakeWord | null>(null);
   const wakeInitRef = useRef(false);
-  const sendRef = useRef<(text: string, mode: "voice" | "text") => void>(() => {});
+  const sendRef = useRef<(text: string, mode: "voice" | "text", voiceToken?: string | null) => void>(() => {});
   const endSessionRef = useRef<() => void>(() => {});
+
+  /* ───────── Security: Windows lock + Face ID ───────── */
+  const [locked, setLocked] = useState(false);
+  const lockedRef = useRef(false);
+  const [identity, setIdentity] = useState<IdentityState>("off");
+  const enrolledRef = useRef(false);
+
+  const loadIdentity = useCallback(async () => {
+    try {
+      const v = await getJSON<{ enrolled: boolean }>("/api/voiceprint");
+      enrolledRef.current = v.enrolled;
+      setIdentity(v.enrolled ? "ready" : "off");
+    } catch {}
+  }, []);
+
+  const refuse = useCallback((kind: "stranger" | "unclear" | "typed") => {
+    const line =
+      kind === "unclear"
+        ? "I didn't hear enough of your voice to be sure it's you. Say that again?"
+        : kind === "typed"
+          ? "Talk to me first so I can recognise your voice, then you can type."
+          : "Sorry, I only take instructions from my owner.";
+    setNotice(kind === "stranger" ? "Voice not recognised — SUNDAY refused." : line);
+    speakerRef.current?.say(line);
+  }, []);
+
+  /** Voice ID for one spoken request: lets sir through with a chat token, refuses anyone else. */
+  const checkVoice = useCallback(
+    async (audio?: Int16Array): Promise<{ ok: boolean; token: string | null }> => {
+      if (!enrolledRef.current) return { ok: true, token: null };
+      if (!audio || audio.length < 16_000 * 0.8) {
+        refuse("unclear");
+        return { ok: false, token: null };
+      }
+      const r = await verifyVoice(audio);
+      if (!r) {
+        setNotice("Voice ID is unavailable right now, so I can't confirm it's you.");
+        return { ok: false, token: null };
+      }
+      if (!r.enrolled) {
+        enrolledRef.current = false;
+        setIdentity("off");
+        return { ok: true, token: null };
+      }
+      if (r.owner) {
+        setIdentity("owner");
+        return { ok: true, token: r.token };
+      }
+      setIdentity(r.problem ? "ready" : "denied");
+      refuse(r.problem ? "unclear" : "stranger");
+      return { ok: false, token: null };
+    },
+    [refuse],
+  );
 
   const armIdle = useCallback(() => {
     if (idleRef.current) clearTimeout(idleRef.current);
@@ -144,7 +202,7 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
           });
         }
       },
-      onUtterance: async (text: string) => {
+      onUtterance: async (text: string, audio?: Int16Array) => {
         setInterim("");
         armIdle();
         if (speaking() && !HARD_STOP.test(text) && statusRef.current?.typesafe) {
@@ -153,18 +211,25 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
           if (p !== null && p < INTERRUPT_THRESHOLD && speaking()) return;
         }
         bargeIn();
-        sendRef.current(text, "voice");
+        // Voice ID: only sir's voice reaches the brain.
+        const verdict = await checkVoice(audio);
+        if (!verdict.ok) return;
+        sendRef.current(text, "voice", verdict.token);
       },
       onError: (msg: string) => setNotice(msg),
     };
     if (statusRef.current?.stt === "deepgram") earRef.current = new DeepgramEar(hooks);
     else if (BrowserEar.supported() && !window.sundayDesktop) earRef.current = new BrowserEar(hooks);
     return earRef.current;
-  }, [armIdle, bargeIn, isInterruption]);
+  }, [armIdle, bargeIn, checkVoice, isInterruption]);
 
   const startSession = useCallback(async () => {
     speakerRef.current?.unlock();
     if (sessionRef.current) return;
+    if (lockedRef.current) {
+      setNotice("SUNDAY is locked. Unlock Windows to continue.");
+      return;
+    }
     const ear = ensureEar();
     if (!ear) {
       setNotice("Voice input needs a Deepgram key (DEEPGRAM_API_KEY in .env). You can still type to me.");
@@ -195,16 +260,20 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     earRef.current?.stop();
     setInterim("");
     chime("sleep");
-    void wakeRef.current?.resume().catch(() => {});
+    if (!lockedRef.current) void wakeRef.current?.resume().catch(() => {});
     if (!inFlightRef.current && !speakerRef.current?.speaking) setState("standby");
   }, []);
   endSessionRef.current = endSession;
 
   const send = useCallback(
-    async (text: string, mode: "voice" | "text") => {
+    async (text: string, mode: "voice" | "text", voiceToken?: string | null) => {
       const clean = text.trim();
       if (!clean) return;
       speakerRef.current?.unlock();
+      if (lockedRef.current) {
+        setNotice("SUNDAY is locked. Unlock Windows to continue.");
+        return;
+      }
       inFlightRef.current?.abort();
       speakerRef.current?.stop();
       const ctrl = new AbortController();
@@ -225,7 +294,7 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
         setEntries((list) => list.map((e) => (e.id === replyId ? fn(e) : e)));
 
       try {
-        for await (const ev of streamChat({ conversationId: convRef.current, text: clean, mode }, ctrl.signal)) {
+        for await (const ev of streamChat({ conversationId: convRef.current, text: clean, mode, voiceToken }, ctrl.signal)) {
           switch (ev.type) {
             case "meta":
               convRef.current = ev.conversationId;
@@ -253,6 +322,13 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
         }
       } catch (err) {
         if (ctrl.signal.aborted) return;
+        if (err instanceof NotOwnerError) {
+          // The server didn't accept this as sir: drop the exchange and refuse.
+          setEntries((list) => list.slice(0, -2));
+          if (inFlightRef.current === ctrl) inFlightRef.current = null;
+          refuse(mode === "text" ? "typed" : "stranger");
+          return;
+        }
         const message = err instanceof Error ? err.message : String(err);
         patch((e) => ({ ...e, error: message }));
       } finally {
@@ -263,9 +339,9 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
       if (speak) speakerRef.current?.flush();
       else settle();
     },
-    [settle],
+    [refuse, settle],
   );
-  sendRef.current = (t, m) => void send(t, m);
+  sendRef.current = (t, m, token) => void send(t, m, token);
 
   const toggleSession = useCallback(() => {
     if (speakerRef.current?.speaking) {
@@ -308,7 +384,7 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
           try {
             await wake.init(s.wake, () => void startSession());
             wakeRef.current = wake;
-            if (!sessionRef.current) await wake.resume();
+            if (!sessionRef.current && !lockedRef.current) await wake.resume();
           } catch (err) {
             const noMic = err instanceof DOMException && (err.name === "NotFoundError" || err.name === "NotReadableError");
             setNotice(
@@ -339,21 +415,40 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     // A microphone was plugged in (or changed): start wake-word listening if it isn't running.
     const onDevices = () => {
       const wake = wakeRef.current;
-      if (!wake || wake.active || sessionRef.current) return;
+      if (!wake || wake.active || sessionRef.current || lockedRef.current) return;
       wake
         .resume()
         .then(() => setNotice(null))
         .catch(() => {});
     };
     navigator.mediaDevices?.addEventListener("devicechange", onDevices);
+
+    // Windows locked or asleep: drop everything; nothing works until sir unlocks.
+    void loadIdentity();
+    const offLock = window.sundayDesktop?.onLock?.(() => {
+      lockedRef.current = true;
+      setLocked(true);
+      inFlightRef.current?.abort();
+      speakerRef.current?.stop();
+      endSessionRef.current();
+      void wakeRef.current?.pause().catch(() => {});
+      setIdentity(enrolledRef.current ? "ready" : "off");
+    });
+    const offUnlock = window.sundayDesktop?.onUnlock?.(() => {
+      lockedRef.current = false;
+      setLocked(false);
+      if (!sessionRef.current) void wakeRef.current?.resume().catch(() => {});
+    });
     return () => {
       cancelled = true;
       clearInterval(timer);
       offSummon?.();
+      offLock?.();
+      offUnlock?.();
       window.removeEventListener("keydown", onKey);
       navigator.mediaDevices?.removeEventListener("devicechange", onDevices);
     };
-  }, [settle, startSession, toggleSession]);
+  }, [loadIdentity, settle, startSession, toggleSession]);
 
   const level = useCallback(() => {
     if (speakerRef.current?.speaking) return speakerRef.current.level();
@@ -376,5 +471,8 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     toggleSession,
     loadConversation,
     level,
+    locked,
+    identity,
+    reloadIdentity: loadIdentity,
   };
 }

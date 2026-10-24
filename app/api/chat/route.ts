@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { describeError, runAgent, type AgentEvent } from "@/lib/server/agent";
 import { ensureConversation } from "@/lib/server/memory";
+import { allowChat } from "@/lib/server/speaker";
 
 const Body = z.object({
   conversationId: z.string().nullish(),
   text: z.string().trim().min(1).max(20_000),
   mode: z.enum(["voice", "text"]).default("text"),
+  voiceToken: z.string().max(64).nullish(),
 });
 
 /** Streams SUNDAY's reply as newline-delimited JSON events. */
@@ -13,6 +15,10 @@ export async function POST(req: Request) {
   const parsed = Body.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return Response.json({ error: "Bad request" }, { status: 400 });
   const { text, mode } = parsed.data;
+  // Voice ID: only sir gets through, whatever the UI does.
+  if (!allowChat(mode, parsed.data.voiceToken)) {
+    return Response.json({ error: "not-owner" }, { status: 403 });
+  }
   const conversationId = ensureConversation(parsed.data.conversationId);
 
   const encoder = new TextEncoder();

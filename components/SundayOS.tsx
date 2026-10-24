@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getJSON, type BrainData, type SystemStatus } from "@/lib/client/api";
-import { useSunday, type ChatEntry } from "@/lib/client/useSunday";
+import { useSunday, type ChatEntry, type IdentityState } from "@/lib/client/useSunday";
+import { VoiceEnroll } from "./VoiceEnroll";
+import { BootSequence } from "./BootSequence";
 import { Brain3D, GROUP_COLORS, GROUP_LABELS, type BrainHandle } from "./Brain3D";
 import {
   CloseIcon,
@@ -33,6 +35,10 @@ export function SundayOS() {
   const [autoOrbit, setAutoOrbit] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [booted, setBooted] = useState(false);
+  const [enrollOpen, setEnrollOpen] = useState(false);
+  // The WebGL brain is heavy to set up; it starts at the boot's logo reveal so it
+  // can't stall the assembly animation, and is ready when the HUD dives into it.
+  const [brainOn, setBrainOn] = useState(false);
   const [isDesktop, setIsDesktop] = useState(false);
 
   const loadBrain = useCallback(async () => {
@@ -90,6 +96,7 @@ export function SundayOS() {
 
   return (
     <div className="os">
+      {(brainOn || booted) && (
       <Brain3D
         ref={brain}
         data={data}
@@ -103,6 +110,7 @@ export function SundayOS() {
         selected={selected}
         onSelect={select}
       />
+      )}
       <div className="vignette" aria-hidden />
       {isDesktop && <div className="dragbar" aria-hidden />}
 
@@ -160,7 +168,12 @@ export function SundayOS() {
           onToggle={sunday.toggleSession}
         />
 
-        <SystemsPanel status={sunday.status} isDesktop={isDesktop} />
+        <SystemsPanel
+          status={sunday.status}
+          isDesktop={isDesktop}
+          identity={sunday.identity}
+          onVoiceSetup={() => setEnrollOpen(true)}
+        />
       </aside>
 
       <Dock
@@ -187,7 +200,24 @@ export function SundayOS() {
       />
 
       {isDesktop && <WindowControls />}
-      {!booted && <Boot status={sunday.status} nodes={data?.nodes.length ?? 0} onDone={() => setBooted(true)} />}
+      {enrollOpen && (
+        <VoiceEnroll onClose={() => setEnrollOpen(false)} onSaved={() => void sunday.reloadIdentity()} />
+      )}
+      {sunday.locked && (
+        <div className="lock-screen" role="alert">
+          <div className="lock-card">
+            <p className="lock-mark">SUNDAY</p>
+            <p className="lock-title">Locked</p>
+            <p className="lock-sub">Unlock Windows to wake me up.</p>
+          </div>
+        </div>
+      )}
+      {!booted && <BootSequence
+          status={sunday.status}
+          nodes={data?.nodes.length ?? 0}
+          onReveal={() => setBrainOn(true)}
+          onDone={() => setBooted(true)}
+        />}
     </div>
   );
 }
@@ -392,7 +422,24 @@ function Toggle({ label, on, set }: { label: string; on: boolean; set: (v: boole
 
 /* ───────────────────────── Systems ───────────────────────── */
 
-function SystemsPanel({ status, isDesktop }: { status: SystemStatus | null; isDesktop: boolean }) {
+const IDENTITY_TEXT: Record<IdentityState, string> = {
+  off: "not set up",
+  ready: "armed",
+  owner: "you, verified",
+  denied: "stranger refused",
+};
+
+function SystemsPanel({
+  status,
+  isDesktop,
+  identity,
+  onVoiceSetup,
+}: {
+  status: SystemStatus | null;
+  isDesktop: boolean;
+  identity: IdentityState;
+  onVoiceSetup: () => void;
+}) {
   const [autoStart, setAutoStart] = useState<boolean | null>(null);
   useEffect(() => {
     if (isDesktop) void window.sundayDesktop?.getAutoStart().then(setAutoStart);
@@ -411,6 +458,16 @@ function SystemsPanel({ status, isDesktop }: { status: SystemStatus | null; isDe
       name: "Wake word",
       ok: status.wake.ready,
       value: status.wake.ready ? "“Hey Sunday” armed" : `needs ${status.wake.missing.join(", ")}`,
+    },
+    {
+      name: "Voice ID",
+      ok: identity === "off" ? "partial" : identity !== "denied",
+      value: IDENTITY_TEXT[identity],
+      action: (
+        <button className="link-btn" onClick={onVoiceSetup}>
+          {identity === "off" ? "Set up" : "Redo"}
+        </button>
+      ),
     },
     {
       name: "Instinct",
@@ -699,44 +756,6 @@ function WindowControls() {
       <button className="icon-btn ghost" onClick={() => window.sundayDesktop?.hide()} aria-label="Hide to tray">
         <CloseIcon width={15} height={15} />
       </button>
-    </div>
-  );
-}
-
-function Boot({ status, nodes, onDone }: { status: SystemStatus | null; nodes: number; onDone: () => void }) {
-  const [step, setStep] = useState(0);
-  const [leaving, setLeaving] = useState(false);
-  const lines = [
-    ["Neural core", status ? (status.brain ? "online" : "no key") : "…"],
-    ["Neural map", nodes ? `${nodes} neurons` : "mapping"],
-    ["Voice", status ? (status.voice.elevenlabs ? "ElevenLabs" : "system") : "…"],
-    ["Drives", status ? status.drives.map((d) => d.slice(0, 2)).join("  ") : "…"],
-  ];
-
-  // Scheduled once: parent re-renders must not restart the sequence.
-  const doneRef = useRef(onDone);
-  doneRef.current = onDone;
-  useEffect(() => {
-    const STEP = 170;
-    const timers = [1, 2, 3, 4].map((i) => setTimeout(() => setStep(i), i * STEP));
-    timers.push(setTimeout(() => setLeaving(true), 4 * STEP + 420));
-    timers.push(setTimeout(() => doneRef.current(), 4 * STEP + 820));
-    return () => timers.forEach(clearTimeout);
-  }, []);
-
-  return (
-    <div className="boot" data-leaving={leaving || undefined} onClick={() => doneRef.current()}>
-      <div className="boot-inner">
-        <p className="boot-mark">SUNDAY</p>
-        <ul>
-          {lines.slice(0, step).map(([k, v]) => (
-            <li key={k}>
-              <span>{k}</span>
-              <span>{v}</span>
-            </li>
-          ))}
-        </ul>
-      </div>
     </div>
   );
 }

@@ -2,7 +2,19 @@ import "server-only";
 import { existsSync, promises as fs } from "node:fs";
 import path from "node:path";
 import { driveRoots } from "./config";
-import { db, kvGet, kvSet, transaction } from "./db";
+import { indexDb, transaction } from "./db";
+
+/** Scan bookkeeping lives inside file-index.db, so deleting that file forces a fresh scan. */
+function metaGet<T>(key: string): T | undefined {
+  const row = indexDb().prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined;
+  return row ? (JSON.parse(row.value) as T) : undefined;
+}
+
+function metaSet(key: string, value: unknown) {
+  indexDb()
+    .prepare("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run(key, JSON.stringify(value));
+}
 
 const win = path.win32;
 
@@ -53,7 +65,7 @@ const state = g.__sundayIndexer;
 export function indexerStatus() {
   const out: Record<string, DriveStatus> = {};
   for (const root of driveRoots()) {
-    const saved = kvGet<{ finishedAt: number; count: number }>(`index:${root}`);
+    const saved = metaGet<{ finishedAt: number; count: number }>(`index:${root}`);
     out[root] = state.status[root] ?? (saved ? { state: "done", ...saved } : { state: "idle", count: 0 });
   }
   return out;
@@ -72,7 +84,7 @@ async function runIndexPass(force = false) {
   state.running = true;
   try {
     for (const root of driveRoots()) {
-      const saved = kvGet<{ finishedAt: number }>(`index:${root}`);
+      const saved = metaGet<{ finishedAt: number }>(`index:${root}`);
       if (!force && saved && Date.now() - saved.finishedAt < REINDEX_AFTER_MS) continue;
       await indexDrive(root);
     }
@@ -89,7 +101,7 @@ async function indexDrive(root: string) {
   const gen = Date.now();
   const status: DriveStatus = { state: "indexing", count: 0, startedAt: gen };
   state.status[root] = status;
-  const insert = db().prepare(
+  const insert = indexDb().prepare(
     "INSERT INTO files_fts(name, path, drive, ext, size, mtime, is_dir, gen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
   let batch: [name: string, path: string, ext: string, size: number, mtime: number, isDir: number][] = [];
@@ -99,7 +111,7 @@ async function indexDrive(root: string) {
     batch = [];
     transaction(() => {
       for (const r of rows) insert.run(r[0], r[1], root, r[2], r[3], r[4], r[5], gen);
-    });
+    }, indexDb());
   };
 
   try {
@@ -131,10 +143,10 @@ async function indexDrive(root: string) {
       }
     }
     flush();
-    db().prepare("DELETE FROM files_fts WHERE drive = ? AND gen != ?").run(root, gen);
+    indexDb().prepare("DELETE FROM files_fts WHERE drive = ? AND gen != ?").run(root, gen);
     status.state = "done";
     status.finishedAt = Date.now();
-    kvSet(`index:${root}`, { finishedAt: status.finishedAt, count: status.count });
+    metaSet(`index:${root}`, { finishedAt: status.finishedAt, count: status.count });
   } catch (err) {
     status.state = "error";
     status.error = err instanceof Error ? err.message : String(err);
@@ -145,7 +157,7 @@ async function indexDrive(root: string) {
 export function indexPath(p: string, isDir: boolean) {
   const root = win.parse(p).root.toUpperCase();
   const name = win.basename(p);
-  db()
+  indexDb()
     .prepare(
       "INSERT INTO files_fts(name, path, drive, ext, size, mtime, is_dir, gen) VALUES (?, ?, ?, ?, 0, 0, ?, 0)",
     )
@@ -184,7 +196,7 @@ export function searchIndex(query: string, opts: SearchOptions = {}) {
   if (opts.kind === "folder") where.push("is_dir = 1");
   if (!where.length) return [];
 
-  const rows = db()
+  const rows = indexDb()
     .prepare(
       `SELECT name, path, is_dir FROM files_fts WHERE ${where.join(" AND ")} ${
         terms.length ? "ORDER BY rank" : ""

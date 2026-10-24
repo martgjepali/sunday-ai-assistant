@@ -21,7 +21,8 @@ type Skill = { name: string; description: string; dir: string; source: string };
 
 function skillDirs(): { dir: string; source: string }[] {
   const roots: { root: string; source: string }[] = [
-    { root: path.join(process.cwd(), ".claude", "skills"), source: "project" },
+    // Read at runtime only — keep Turbopack from tracing (and choking on) skill folders at build time.
+    { root: path.join(/* turbopackIgnore: true */ process.cwd(), ".claude", "skills"), source: "project" },
     { root: path.join(HOME, ".claude", "skills"), source: "user" },
     { root: path.join(HOME, ".agents", "skills"), source: "user" },
   ];

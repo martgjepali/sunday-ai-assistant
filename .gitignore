@@ -46,3 +46,6 @@ next-env.d.ts
 
 # Vosk wake-word model (40 MB)
 /public/wake/*.tar.gz
+
+# Speaker-recognition model (26 MB) — download: see README / .env.example
+/models/

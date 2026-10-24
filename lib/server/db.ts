@@ -50,11 +50,6 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content, category ON me
   INSERT INTO memories_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
 END;
 
--- File index: one FTS row per file/folder. Only 'name' is tokenized.
-CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-  name, path UNINDEXED, drive UNINDEXED, ext UNINDEXED, size UNINDEXED,
-  mtime UNINDEXED, is_dir UNINDEXED, gen UNINDEXED, tokenize='unicode61', prefix='2 3'
-);
 
 -- Everything SUNDAY does, for the brain view and for "what did you do earlier".
 CREATE TABLE IF NOT EXISTS activity (
@@ -81,21 +76,64 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 `;
 
-const g = globalThis as unknown as { __sundayDb?: DatabaseSync };
+/**
+ * The drive index lives in its own file: it's a large, rebuildable cache, so
+ * keeping it out of sunday.db leaves her memory small, easy to open and back up.
+ */
+const INDEX_SCHEMA = `
+-- One FTS row per file/folder. Only 'name' is tokenized.
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+  name, path UNINDEXED, drive UNINDEXED, ext UNINDEXED, size UNINDEXED,
+  mtime UNINDEXED, is_dir UNINDEXED, gen UNINDEXED, tokenize='unicode61', prefix='2 3'
+);
+-- When each drive was last scanned. Lives with the index so deleting this file forces a rescan.
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+const g = globalThis as unknown as { __sundayDb?: DatabaseSync; __sundayIndexDb?: DatabaseSync };
+
+function open(file: string) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const database = new DatabaseSync(path.join(DATA_DIR, file));
+  database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+  return database;
+}
 
 export function db(): DatabaseSync {
   if (!g.__sundayDb) {
-    mkdirSync(DATA_DIR, { recursive: true });
-    const database = new DatabaseSync(path.join(DATA_DIR, "sunday.db"));
-    database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+    const database = open("sunday.db");
     database.exec(SCHEMA);
     const messageCols = database.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
     if (!messageCols.some((c) => c.name === "actions")) {
       database.exec("ALTER TABLE messages ADD COLUMN actions TEXT");
     }
+    // One-time move: the file index used to live in sunday.db. Drop that cache
+    // (it's rebuilt in file-index.db) and compact the file back to its real size.
+    const legacyIndex = database
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files_fts'")
+      .get();
+    if (legacyIndex) {
+      database.exec("DROP TABLE files_fts");
+      database.exec("DELETE FROM kv WHERE key LIKE 'index:%'");
+      database.exec("VACUUM");
+      // In WAL mode the compacted file only replaces the old one at a checkpoint.
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
     g.__sundayDb = database;
   }
   return g.__sundayDb;
+}
+
+export function indexDb(): DatabaseSync {
+  if (!g.__sundayIndexDb) {
+    const database = open("file-index.db");
+    database.exec(INDEX_SCHEMA);
+    g.__sundayIndexDb = database;
+  }
+  return g.__sundayIndexDb;
 }
 
 export function kvGet<T>(key: string): T | undefined {
@@ -121,8 +159,7 @@ export function logActivity(kind: string, label: string, detail?: string) {
     .run(kind, label, detail ?? null, Date.now());
 }
 
-export function transaction(fn: () => void) {
-  const d = db();
+export function transaction(fn: () => void, d: DatabaseSync = db()) {
   d.exec("BEGIN");
   try {
     fn();

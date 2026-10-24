@@ -13,7 +13,7 @@ if (typeof require("electron") === "string") {
   return;
 }
 
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, shell, session, dialog } = require("electron");
+const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, shell, session, dialog, powerMonitor } = require("electron");
 const { spawn } = require("node:child_process");
 const { existsSync } = require("node:fs");
 const http = require("node:http");
@@ -80,6 +80,16 @@ async function startServer() {
 }
 
 /** A small amber ring with a violet core, drawn in code so no image asset is needed. */
+/** SUNDAY's icon (electron/icon.png), falling back to the drawn ring if it's missing. */
+function appIcon(size) {
+  const file = path.join(__dirname, "icon.png");
+  if (existsSync(file)) {
+    const img = nativeImage.createFromPath(file);
+    if (!img.isEmpty()) return img.resize({ width: size, height: size, quality: "best" });
+  }
+  return makeIcon(size);
+}
+
 function makeIcon(size) {
   const buf = Buffer.alloc(size * size * 4);
   const c = (size - 1) / 2;
@@ -116,7 +126,7 @@ function createWindow() {
     show: false,
     title: "SUNDAY",
     backgroundColor: "#04050a",
-    icon: makeIcon(64),
+    icon: appIcon(256),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -149,7 +159,7 @@ function createWindow() {
 }
 
 function createTray() {
-  tray = new Tray(makeIcon(16));
+  tray = new Tray(appIcon(16));
   tray.setToolTip("SUNDAY");
   const autoStart = () => app.getLoginItemSettings(loginArgs()).openAtLogin;
   const rebuild = () =>
@@ -190,6 +200,10 @@ function summon() {
   win?.webContents.send("sunday:summon");
 }
 
+// One identity for the window, taskbar button and pinned shortcut.
+app.setName("SUNDAY");
+if (process.platform === "win32") app.setAppUserModelId("com.sunday.assistant");
+
 app.whenReady().then(async () => {
   const ses = session.defaultSession;
   const allowed = new Set(["media", "clipboard-sanitized-write", "notifications"]);
@@ -212,6 +226,12 @@ app.whenReady().then(async () => {
   }
   createWindow();
   createTray();
+
+  // SUNDAY locks with Windows: nobody can talk to her without getting into sir's account.
+  const lock = () => win?.webContents.send("sunday:lock");
+  powerMonitor.on("lock-screen", lock);
+  powerMonitor.on("suspend", lock);
+  powerMonitor.on("unlock-screen", () => win?.webContents.send("sunday:unlock"));
   if (!globalShortcut.register(HOTKEY, summon)) console.warn(`[sunday] couldn't register ${HOTKEY}`);
 });
 

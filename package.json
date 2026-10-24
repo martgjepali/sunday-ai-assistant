@@ -10,7 +10,8 @@
     "start": "next start -H 127.0.0.1 -p 3210",
     "desktop": "electron .",
     "desktop:dev": "electron . --dev",
-    "lint": "eslint"
+    "lint": "eslint",
+    "shortcuts": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-shortcuts.ps1"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
@@ -20,6 +21,7 @@
     "next": "16.4.2",
     "react": "19.3.0",
     "react-dom": "19.3.0",
+    "sherpa-onnx-node": "^2.0.0",
     "three": "^0.186.1",
     "three-spritetext": "^1.10.0",
     "vosk-browser": "^0.0.8",
@@ -37,5 +39,6 @@
     "server-only": "^0.0.1",
     "tailwindcss": "^4",
     "typescript": "^5"
-  }
+  },
+  "productName": "SUNDAY"
 }
