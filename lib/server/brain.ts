@@ -44,6 +44,10 @@ const HUBS: Record<string, string> = {
   web: "Web",
   skills: "Skills",
   code: "Code",
+  time: "Time",
+  screen: "Screen",
+  pc: "PC",
+  docs: "Documents",
 };
 
 const SKIP_DIRS = /^(\$|system volume information$|windows$|program files|programdata$|recovery$|perflogs$|config\.msi$|msocache$|boot$|documents and settings$|onedrivetemp$)/i;

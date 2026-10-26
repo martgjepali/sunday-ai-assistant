@@ -13,7 +13,7 @@ if (typeof require("electron") === "string") {
   return;
 }
 
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, shell, session, dialog, powerMonitor } = require("electron");
+const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, shell, session, dialog, powerMonitor, desktopCapturer, screen } = require("electron");
 const { spawn } = require("node:child_process");
 const { existsSync } = require("node:fs");
 const http = require("node:http");
@@ -195,7 +195,126 @@ function setAutoStart(on) {
   return app.getLoginItemSettings(opts).openAtLogin;
 }
 
+/**
+ * Screenshot for Claude: the monitor sir's mouse is on (or a given display),
+ * scaled to at most 1568px. SUNDAY's own window is excluded from the capture
+ * (Windows display affinity), so she sees what's behind her rather than herself.
+ * `region` (in the coordinates of a full screenshot of size `base`) returns a
+ * zoomed crop at native resolution. `physical` maps image pixels to the real
+ * screen for computer use.
+ */
+async function captureScreen(opts = {}) {
+  const display =
+    (opts.displayId && screen.getAllDisplays().find((d) => String(d.id) === String(opts.displayId))) ||
+    screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const scale = Math.min(1, 1568 / Math.max(display.size.width, display.size.height)); // Claude's sweet spot
+  const native = { width: Math.round(display.size.width * display.scaleFactor), height: Math.round(display.size.height * display.scaleFactor) };
+  const zoom = Array.isArray(opts.region) && opts.region.length === 4 && opts.base;
+  const size = zoom ? native : { width: Math.round(display.size.width * scale), height: Math.round(display.size.height * scale) };
+  const hideSelf = win && win.isVisible() && !win.isMinimized();
+  if (driving) driving.lastSeen = Date.now();
+  try {
+    if (hideSelf) {
+      win.setContentProtection(true);
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    const sources = await desktopCapturer.getSources({ types: ["screen"], thumbnailSize: size });
+    const source = sources.find((s) => s.display_id === String(display.id)) ?? sources[0];
+    if (!source || source.thumbnail.isEmpty()) return { error: "Windows didn't return a screen image." };
+    let image = source.thumbnail;
+    if (zoom) {
+      const full = image.getSize();
+      const k = full.width / opts.base.width;
+      const [x0, y0, x1, y1] = opts.region.map(Number);
+      const rect = {
+        x: Math.max(0, Math.round(Math.min(x0, x1) * k)),
+        y: Math.max(0, Math.round(Math.min(y0, y1) * k)),
+        width: Math.max(8, Math.round(Math.abs(x1 - x0) * k)),
+        height: Math.max(8, Math.round(Math.abs(y1 - y0) * k)),
+      };
+      rect.width = Math.min(rect.width, full.width - rect.x);
+      rect.height = Math.min(rect.height, full.height - rect.y);
+      image = image.crop(rect);
+      const fit = 1568 / Math.max(rect.width, rect.height);
+      image = image.resize({ width: Math.round(rect.width * fit), height: Math.round(rect.height * fit), quality: "best" });
+    }
+    const got = image.getSize();
+    const topLeft = process.platform === "win32" ? screen.dipToScreenPoint({ x: display.bounds.x, y: display.bounds.y }) : display.bounds;
+    return {
+      data: image.toJPEG(82).toString("base64"),
+      width: got.width,
+      height: got.height,
+      displayId: String(display.id),
+      physical: { x: topLeft.x, y: topLeft.y, width: native.width, height: native.height },
+    };
+  } catch (err) {
+    return { error: "Screen capture failed: " + (err && err.message ? err.message : err) };
+  } finally {
+    if (hideSelf) win.setContentProtection(false);
+  }
+}
+
+/* While SUNDAY drives the mouse and keyboard her window gets out of the way and
+   a small click-through pill says so. A watchdog ends it if the task goes quiet. */
+let driving = null;
+
+const PILL_HTML = '<!doctype html><html><body style="margin:0;background:transparent;overflow:hidden;font:600 13px Segoe UI,sans-serif">' +
+  '<div style="display:flex;align-items:center;gap:10px;height:36px;padding:0 16px;border-radius:18px;background:rgba(6,14,24,.86);color:#cfefff;border:1px solid rgba(96,214,255,.55);box-shadow:0 0 18px rgba(64,196,255,.35)">' +
+  '<span style="width:9px;height:9px;border-radius:50%;background:#45d4ff;box-shadow:0 0 10px #45d4ff;animation:p 1.2s ease-in-out infinite"></span>' +
+  "SUNDAY is using your computer — move the mouse or press Ctrl+Shift+Space to take over</div>" +
+  "<style>@keyframes p{50%{opacity:.35}}</style></body></html>";
+
+async function startDriving() {
+  if (driving) return { displayId: driving.displayId };
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const wasShown = Boolean(win && win.isVisible() && !win.isMinimized());
+  if (wasShown) win.minimize();
+  const width = 620;
+  const pill = new BrowserWindow({
+    width,
+    height: 40,
+    x: display.workArea.x + Math.round((display.workArea.width - width) / 2),
+    y: display.workArea.y + 10,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    hasShadow: false,
+    show: false,
+    webPreferences: { sandbox: true, contextIsolation: true },
+  });
+  pill.setAlwaysOnTop(true, "screen-saver");
+  pill.setIgnoreMouseEvents(true);
+  pill.setContentProtection(true); // never in her own screenshots
+  pill.once("ready-to-show", () => pill.showInactive());
+  void pill.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(PILL_HTML));
+  driving = { displayId: String(display.id), wasShown, pill, lastSeen: Date.now() };
+  driving.watchdog = setInterval(() => {
+    if (driving && Date.now() - driving.lastSeen > 120_000) stopDriving();
+  }, 10_000);
+  await new Promise((r) => setTimeout(r, 400)); // let the minimise animation finish
+  return { displayId: driving.displayId };
+}
+
+function stopDriving() {
+  if (!driving) return { ok: true };
+  clearInterval(driving.watchdog);
+  if (!driving.pill.isDestroyed()) driving.pill.destroy();
+  if (driving.wasShown && win) win.showInactive(); // back on screen without stealing focus
+  driving = null;
+  return { ok: true };
+}
+
 function summon() {
+  if (driving) {
+    // The hotkey doubles as the "take over" switch while she's driving.
+    win?.webContents.send("sunday:stop-drive");
+    stopDriving();
+    return;
+  }
   showWindow();
   win?.webContents.send("sunday:summon");
 }
@@ -215,6 +334,8 @@ app.whenReady().then(async () => {
   ipcMain.on("win:minimize", () => win?.minimize());
   ipcMain.on("win:hide", () => win?.hide());
   ipcMain.on("win:fullscreen", () => win?.setFullScreen(!win.isFullScreen()));
+  ipcMain.handle("screen:capture", (_e, opts) => captureScreen(opts || {}));
+  ipcMain.handle("agent:drive", (_e, on) => (on ? startDriving() : stopDriving()));
   ipcMain.handle("autostart:get", () => app.getLoginItemSettings(loginArgs()).openAtLogin);
   ipcMain.handle("autostart:set", (_e, on) => setAutoStart(Boolean(on)));
 

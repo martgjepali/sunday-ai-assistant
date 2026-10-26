@@ -266,7 +266,7 @@ export async function createFolder(input: string) {
   return { path: p, created: true };
 }
 
-function uniqueTarget(target: string) {
+export function uniqueTarget(target: string) {
   if (!existsSync(target)) return target;
   const dir = win.dirname(target);
   const ext = win.extname(target);

@@ -2,6 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import { EFFORT, MODEL } from "./config";
 import { addMessage, conversationHistory, reflectOnExchange } from "./memory";
+import { requestFromClient } from "./bridge";
 import { PERSONA, dynamicContext } from "./persona";
 import type { ChatSecurity } from "./speaker";
 import { runTool, toolHub, toolSchemas } from "./tools";
@@ -11,6 +12,7 @@ export type AgentEvent =
   | { type: "text"; delta: string }
   | { type: "tool"; id: string; name: string; hub: string; status: "start" | "done" | "error"; detail?: string }
   | { type: "activate"; ids: string[] }
+  | { type: "request"; id: string; kind: string; payload?: unknown }
   | { type: "done"; text: string }
   | { type: "error"; message: string };
 
@@ -119,7 +121,11 @@ export async function runAgent(opts: {
 
       const results = await Promise.all(
         toolUses.map(async (tu) => {
-          const outcome = await runTool(tu.name, tu.input, { conversationId });
+          const outcome = await runTool(tu.name, tu.input, {
+            conversationId,
+            requestClient: (kind, payload) => requestFromClient(emit, kind, payload),
+            signal,
+          });
           actions.push(describeAction(tu.name, tu.input, outcome.ok, outcome.result));
           emit({
             type: "tool",
@@ -130,8 +136,15 @@ export async function runAgent(opts: {
             detail: outcome.ok ? undefined : String((outcome.result as { error?: unknown }).error ?? ""),
           });
           if (outcome.activate.length) emit({ type: "activate", ids: outcome.activate });
-          let content = JSON.stringify(outcome.result);
-          if (content.length > MAX_TOOL_RESULT) content = content.slice(0, MAX_TOOL_RESULT) + "…(truncated)";
+          let text = JSON.stringify(outcome.result);
+          if (text.length > MAX_TOOL_RESULT) text = text.slice(0, MAX_TOOL_RESULT) + "…(truncated)";
+          // Tools like look_at_screen hand Claude a real image alongside their text result.
+          const content: Anthropic.Beta.BetaToolResultBlockParam["content"] = outcome.image
+            ? [
+                { type: "image", source: { type: "base64", media_type: outcome.image.mediaType, data: outcome.image.data } },
+                { type: "text", text },
+              ]
+            : text;
           return {
             type: "tool_result" as const,
             tool_use_id: tu.id,

@@ -23,6 +23,9 @@ declare global {
       onSummon(cb: () => void): () => void;
       onLock?(cb: () => void): () => void;
       onUnlock?(cb: () => void): () => void;
+      onStopDrive?(cb: () => void): () => void;
+      captureScreen?(opts?: unknown): Promise<{ data?: string; width?: number; height?: number; error?: string }>;
+      drive?(on: boolean): Promise<{ displayId?: string; ok?: boolean }>;
       minimize(): void;
       toggleFullscreen(): void;
       hide(): void;
@@ -59,6 +62,8 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
   voiceRepliesRef.current = voiceReplies;
   const sessionRef = useRef(false);
   const inFlightRef = useRef<AbortController | null>(null);
+  /** True while a computer task has the mouse and keyboard. */
+  const drivingRef = useRef(false);
   const idleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const speakerRef = useRef<Speaker | null>(null);
   const earRef = useRef<Ear | null>(null);
@@ -189,7 +194,11 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
       onInterim: (text: string) => {
         setInterim(text);
         armIdle();
-        if (!speaking()) return;
+        if (!speaking()) {
+          // "Stop" also ends a computer task, even when she isn't talking.
+          if (drivingRef.current && HARD_STOP.test(text)) bargeIn();
+          return;
+        }
         if (HARD_STOP.test(text)) return bargeIn();
         if (!statusRef.current?.typesafe) {
           if (words(text) >= 3) bargeIn(); // simple rule without Jev
@@ -280,6 +289,24 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     }
   }, []);
 
+  const answerRequest = async (id: string, kind: string, payload?: unknown) => {
+    let data: unknown = { error: `Unknown request "${kind}"` };
+    const desktop = window.sundayDesktop;
+    if (kind === "screenshot") {
+      data = desktop?.captureScreen
+        ? await desktop.captureScreen(payload).catch((e: unknown) => ({ error: String(e) }))
+        : { error: "Looking at the screen needs the SUNDAY desktop app (open SUNDAY from its icon)." };
+    } else if (kind === "drive-start" || kind === "drive-end") {
+      // Computer use: her window steps aside while she has the mouse and keyboard.
+      const on = kind === "drive-start";
+      drivingRef.current = on && Boolean(desktop?.drive);
+      data = desktop?.drive
+        ? await desktop.drive(on).catch((e: unknown) => ({ error: String(e) }))
+        : { error: "Using the computer needs the SUNDAY desktop app (open SUNDAY from its icon)." };
+    }
+    await api("/api/bridge", { method: "POST", body: JSON.stringify({ id, data }) }).catch(() => {});
+  };
+
   const send = useCallback(
     async (text: string, mode: "voice" | "text", voiceToken?: string | null) => {
       const clean = text.trim();
@@ -329,6 +356,10 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
             case "activate":
               optsRef.current.onActivate(ev.ids);
               break;
+            case "request":
+              // A tool needs something only the desktop app can do; answer without blocking the stream.
+              void answerRequest(ev.id, ev.kind, ev.payload);
+              break;
             case "error":
               patch((e) => ({ ...e, error: ev.message }));
               if (speak) speakerRef.current?.say(ev.message);
@@ -348,6 +379,11 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
         patch((e) => ({ ...e, error: message }));
       } finally {
         if (inFlightRef.current === ctrl) inFlightRef.current = null;
+        if (drivingRef.current && ctrl.signal.aborted) {
+          // Interrupted mid-task: give sir his screen back straight away.
+          drivingRef.current = false;
+          void window.sundayDesktop?.drive?.(false);
+        }
       }
       if (ctrl.signal.aborted) return;
       optsRef.current.onReplyDone();
@@ -416,6 +452,11 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     void refresh();
     const timer = setInterval(refresh, 15_000);
     const offSummon = window.sundayDesktop?.onSummon(() => toggleSession());
+    // Ctrl+Shift+Space while she's driving: stop the task and hand back control.
+    const offStopDrive = window.sundayDesktop?.onStopDrive?.(() => {
+      drivingRef.current = false;
+      bargeIn();
+    });
     const onKey = (e: KeyboardEvent) => {
       if (!window.sundayDesktop && e.ctrlKey && e.shiftKey && e.code === "Space") {
         e.preventDefault();
@@ -458,12 +499,61 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
       cancelled = true;
       clearInterval(timer);
       offSummon?.();
+      offStopDrive?.();
       offLock?.();
       offUnlock?.();
       window.removeEventListener("keydown", onKey);
       navigator.mediaDevices?.removeEventListener("devicechange", onDevices);
     };
-  }, [loadIdentity, settle, startSession, toggleSession]);
+  }, [bargeIn, loadIdentity, settle, startSession, toggleSession]);
+
+  // Reminders and timers: collect whatever is due and announce it — voice, caption and a Windows notification.
+  useEffect(() => {
+    const announce = (r: { kind: "reminder" | "timer"; text: string; late: boolean }) => {
+      const line =
+        r.kind === "timer"
+          ? `Sir, time's up${/\btimer$/i.test(r.text) ? "" : ` — ${r.text}`}.`
+          : r.late
+            ? `Sir, you missed a reminder while I was offline: ${r.text}.`
+            : `Sir, a reminder: ${r.text}.`;
+      chime("wake");
+      speakerRef.current?.say(line);
+      setNotice(line);
+      setEntries((list) => [...list, { id: uid(), role: "assistant", text: line, tools: [] }]);
+      try {
+        new Notification(r.kind === "timer" ? "SUNDAY — timer" : "SUNDAY — reminder", {
+          body: r.text,
+          icon: "/brand/sunday-logo.png",
+          silent: true,
+        });
+      } catch {}
+    };
+    // Background work that finished (a document is ready, a computer task ended).
+    const tell = (n: { title: string; text: string }) => {
+      chime("wake");
+      speakerRef.current?.say(n.text);
+      setNotice(n.text);
+      setEntries((list) => [...list, { id: uid(), role: "assistant", text: n.text, tools: [] }]);
+      try {
+        new Notification(n.title, { body: n.text, icon: "/brand/sunday-logo.png", silent: true });
+      } catch {}
+    };
+    const tick = async () => {
+      try {
+        const res = await api("/api/reminders?action=claim", { method: "POST" });
+        if (!res.ok) return;
+        const { due, notices = [] } = (await res.json()) as {
+          due: { kind: "reminder" | "timer"; text: string; late: boolean }[];
+          notices?: { title: string; text: string }[];
+        };
+        due.forEach(announce);
+        notices.forEach(tell);
+      } catch {}
+    };
+    void tick();
+    const timer = setInterval(tick, 5000);
+    return () => clearInterval(timer);
+  }, []);
 
   const level = useCallback(() => {
     if (speakerRef.current?.speaking) return speakerRef.current.level();

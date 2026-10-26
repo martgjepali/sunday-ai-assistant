@@ -71,6 +71,13 @@ function browserExe(name: BrowserName): string | undefined {
 export const DEFAULT_BROWSER = (process.env.SUNDAY_BROWSER ?? "firefox") as BrowserName;
 
 export async function openUrl(rawUrl: string, browser: BrowserName = DEFAULT_BROWSER) {
+  // Windows Settings pages (ms-settings:display, ms-settings:bluetooth…) open in the Settings app.
+  const settingsPage = rawUrl.trim().match(/^ms-settings:[a-z0-9-]*$/i)?.[0];
+  if (settingsPage) {
+    await launch("explorer.exe", [settingsPage]);
+    logActivity("app", "Settings", settingsPage);
+    return { opened: settingsPage, app: "Settings" };
+  }
   let url: URL;
   try {
     url = new URL(/^[a-z]+:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);

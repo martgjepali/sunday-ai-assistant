@@ -17,6 +17,13 @@ contextBridge.exposeInMainWorld("sundayDesktop", {
     ipcRenderer.on("sunday:unlock", handler);
     return () => ipcRenderer.removeListener("sunday:unlock", handler);
   },
+  onStopDrive(cb) {
+    const handler = () => cb();
+    ipcRenderer.on("sunday:stop-drive", handler);
+    return () => ipcRenderer.removeListener("sunday:stop-drive", handler);
+  },
+  captureScreen: (opts) => ipcRenderer.invoke("screen:capture", opts || {}),
+  drive: (on) => ipcRenderer.invoke("agent:drive", Boolean(on)),
   minimize: () => ipcRenderer.send("win:minimize"),
   hide: () => ipcRenderer.send("win:hide"),
   toggleFullscreen: () => ipcRenderer.send("win:fullscreen"),

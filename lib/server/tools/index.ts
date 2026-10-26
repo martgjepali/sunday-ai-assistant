@@ -21,10 +21,32 @@ import {
   undoFileOperations,
 } from "./files";
 import { editFile, openInVSCode, readCode, searchInFiles, vscodeWorkspaces, writeFile } from "./code";
-import { createDraft, readEmail, searchEmail, triageEmail } from "./gmail";
+import {
+  closeApplication,
+  lockPc,
+  mediaControl,
+  power,
+  readClipboard,
+  showDesktop,
+  systemStatus,
+  volume,
+  writeClipboard,
+} from "./system";
+import { logActivity } from "../db";
+import { createDraft, gmailAccount, readEmail, searchEmail, triageEmail } from "./gmail";
+import { computerTask } from "../computer";
+import { createDocument } from "../documents";
+import { cancelReminder, createReminder, listReminders, markBriefed, todaysReminders, weather } from "../reminders";
 
-export type ToolContext = { conversationId: string };
-export type ToolOutcome = { result: unknown; activate: string[] };
+export type ToolContext = {
+  conversationId: string;
+  /** Ask SUNDAY's window for something only the desktop app can do (e.g. "screenshot"). */
+  requestClient: <T>(kind: string, payload?: unknown) => Promise<T>;
+  /** Fires when sir interrupts or sends something new. */
+  signal?: AbortSignal;
+};
+export type ToolImage = { data: string; mediaType: "image/jpeg" | "image/png" };
+export type ToolOutcome = { result: unknown; activate: string[]; image?: ToolImage };
 
 type ToolDef<S extends z.ZodObject> = {
   name: string;
@@ -166,6 +188,201 @@ const TOOLS = [
     },
   }),
   def({
+    name: "look_at_screen",
+    hub: "screen",
+    description:
+      "See what's on sir's screen right now (the monitor his mouse is on; SUNDAY's own window is hidden from the capture). Use whenever he refers to something visible — 'this', 'that error', 'what am I looking at', 'read this', 'what do you think of this design'. Say what's relevant to his question, not a description of everything.",
+    schema: z.object({ focus: z.string().optional().describe("What he wants you to look at, if he said") }),
+    run: async ({ focus }, ctx) => {
+      const shot = await ctx.requestClient<{ data?: string; width?: number; height?: number; error?: string }>("screenshot");
+      if (!shot?.data) return { result: { error: shot?.error ?? "I couldn't capture the screen." }, activate: ["hub:screen"] };
+      logActivity("screen", "looked at the screen", focus);
+      return {
+        result: { captured: `${shot.width}x${shot.height} screenshot attached`, focus: focus ?? null },
+        activate: ["hub:screen"],
+        image: { data: shot.data, mediaType: "image/jpeg" },
+      };
+    },
+  }),
+  def({
+    name: "read_clipboard",
+    hub: "screen",
+    description: "Read the text sir has copied (Ctrl+C). Use when he says 'what I copied', 'this text', 'translate/fix/summarise what's in my clipboard'.",
+    schema: z.object({}),
+    run: async () => readClipboard(),
+  }),
+  def({
+    name: "write_clipboard",
+    hub: "screen",
+    description: "Put text on sir's clipboard so he can paste it with Ctrl+V — for a rewritten paragraph, a command, code, an address. Tell him it's ready to paste.",
+    schema: z.object({ text: z.string().min(1).max(100_000) }),
+    run: async ({ text }) => writeClipboard(text),
+  }),
+  def({
+    name: "media_control",
+    hub: "pc",
+    description: "Play/pause, next track, previous track or stop — works with Spotify, YouTube in the browser and most players.",
+    schema: z.object({ action: z.enum(["play_pause", "next", "previous", "stop"]) }),
+    run: async ({ action }) => mediaControl(action),
+  }),
+  def({
+    name: "volume",
+    hub: "pc",
+    description: "Read or change the PC's master volume: get, set (level 0-100), up/down (by step, default 10), mute, unmute.",
+    schema: z.object({
+      action: z.enum(["get", "set", "up", "down", "mute", "unmute"]),
+      level: z.number().int().min(0).max(100).optional(),
+      step: z.number().int().min(1).max(50).optional(),
+    }),
+    run: async ({ action, level, step }) => volume(action, level, step),
+  }),
+  def({
+    name: "system_status",
+    hub: "pc",
+    description: "PC health: CPU load, RAM use, disk space on each drive, uptime, battery, and the apps using the most memory.",
+    schema: z.object({}),
+    run: async () => systemStatus(),
+  }),
+  def({
+    name: "lock_pc",
+    hub: "pc",
+    description: "Lock Windows right away (SUNDAY locks with it).",
+    schema: z.object({}),
+    run: async () => lockPc(),
+  }),
+  def({
+    name: "show_desktop",
+    hub: "pc",
+    description: "Minimise all windows to show the desktop.",
+    schema: z.object({}),
+    run: async () => showDesktop(),
+  }),
+  def({
+    name: "power",
+    hub: "pc",
+    description:
+      "Shut down, restart or sleep the PC, or cancel a pending shutdown/restart. NEVER act on the first request: ask sir to confirm out loud ('Shut down now, sir? Anything unsaved will close.'), and only after a clear yes call it with confirmed=true. Shutdown/restart wait delay_minutes (default 1) so he can still cancel.",
+    schema: z.object({
+      action: z.enum(["shutdown", "restart", "sleep", "cancel"]),
+      confirmed: z.boolean(),
+      delay_minutes: z.number().min(0).max(240).optional(),
+    }),
+    run: async ({ action, confirmed, delay_minutes }) => power(action, confirmed, delay_minutes ?? 1),
+  }),
+  def({
+    name: "close_application",
+    hub: "pc",
+    description:
+      "Close an app's windows politely, like clicking X (e.g. 'close Spotify'). Apps with unsaved work will ask him to save. Never force-quits.",
+    schema: z.object({ name: z.string().min(2) }),
+    run: async ({ name }) => closeApplication(name),
+  }),
+  def({
+    name: "computer_task",
+    hub: "pc",
+    description:
+      "Operate the PC like a person — sees the screen, moves the mouse, clicks, scrolls and types — for things no other tool can do: working inside an app's UI, changing an app's setting, filling in a form, navigating a site he's signed in to. Prefer the dedicated tools when they fit (open_application, open_url, files, media, volume, email) — they're faster and safer. Give a complete goal with every detail needed. Sir watches; moving his mouse, saying stop or pressing Ctrl+Shift+Space takes control back. It never types passwords, deletes, pays or changes security settings. If it returns needs_approval, ask sir its question; only after a clear yes call again with the same goal and approved_step set to that step. Desktop app only.",
+    schema: z.object({
+      goal: z.string().min(8).describe("What to achieve, with all details (names, text to type, where to save…)"),
+      approved_step: z.string().optional().describe("A step sir explicitly approved after a needs_approval"),
+    }),
+    run: async ({ goal, approved_step }, ctx) => computerTask({ goal, approvedStep: approved_step }, ctx),
+  }),
+  def({
+    name: "set_reminder",
+    hub: "time",
+    description:
+      "Set a reminder that SUNDAY will announce out loud (and as a Windows notification) at a specific time. Use 'at' for a clock time — a LOCAL date-time 'YYYY-MM-DDTHH:mm' worked out from the current time in your context — or 'in_minutes' for relative times ('in 2 hours' = 120).",
+    schema: z.object({
+      text: z.string().describe("What to remind him of, phrased to be read back, e.g. 'call the bank'"),
+      at: z.string().optional(),
+      in_minutes: z.number().positive().max(60 * 24 * 366).optional(),
+    }),
+    run: async ({ text, at, in_minutes }) => {
+      const r = createReminder({ kind: "reminder", text, at, inMinutes: in_minutes });
+      return { result: r, activate: ["hub:time"] };
+    },
+  }),
+  def({
+    name: "set_timer",
+    hub: "time",
+    description: "Start a countdown timer ('5 minute timer', 'timer for the pasta'). SUNDAY announces it when it ends.",
+    schema: z.object({
+      minutes: z.number().positive().max(24 * 60),
+      label: z.string().optional().describe("What the timer is for"),
+    }),
+    run: async ({ minutes, label }) => createReminder({ kind: "timer", text: label?.trim() || `${minutes} minute timer`, inMinutes: minutes }),
+  }),
+  def({
+    name: "list_reminders",
+    hub: "time",
+    description: "List pending reminders and timers (with ids), optionally including ones that fired in the last day.",
+    schema: z.object({ include_recent: z.boolean().optional() }),
+    run: async ({ include_recent }) => listReminders(include_recent ?? false),
+  }),
+  def({
+    name: "cancel_reminder",
+    hub: "time",
+    description: "Cancel a pending reminder or timer by id (get ids from list_reminders).",
+    schema: z.object({ id: z.number().int() }),
+    run: async ({ id }) => cancelReminder(id),
+  }),
+  def({
+    name: "get_weather",
+    hub: "web",
+    description: "Current weather and today's forecast. Pass city the first time (it's remembered as sir's home city); omit it afterwards.",
+    schema: z.object({ city: z.string().optional() }),
+    run: async ({ city }) => weather(city),
+  }),
+  def({
+    name: "morning_briefing",
+    hub: "time",
+    description:
+      "Gather sir's morning briefing: date, weather, today's reminders, and the important unread emails. Use when he says good morning or asks for his briefing/rundown of the day, then deliver it conversationally — weather in a line, then what's on today, then anything urgent in the inbox.",
+    schema: z.object({ city: z.string().optional().describe("Only if he names a city or none is remembered yet") }),
+    run: async ({ city }) => {
+      const [w, mail] = await Promise.all([
+        weather(city).catch((e) => ({ error: String(e) })),
+        gmailAccount()
+          ? triageEmail("is:unread newer_than:2d", 20)
+              .then((t) => ({
+                unread: t.count,
+                important: t.emails.filter((e) => "urgency" in e && (e.urgency === "today" || e.urgency === "this week")).slice(0, 5),
+              }))
+              .catch((e) => ({ error: String(e) }))
+          : Promise.resolve({ note: "Gmail not connected" }),
+      ]);
+      markBriefed();
+      return {
+        result: {
+          date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
+          weather: w,
+          reminders_today: todaysReminders(),
+          email: mail,
+        },
+        activate: ["hub:time", "hub:mail", "hub:web"],
+      };
+    },
+  }),
+  def({
+    name: "create_document",
+    hub: "docs",
+    description:
+      "Make a real Word (docx), Excel (xlsx), PowerPoint (pptx) or PDF file — reports, letters, CVs, budgets, trackers, pitch decks, invoices. Runs in the background (1-3 min) and SUNDAY announces it when ready; saved in Documents\\SUNDAY Documents unless he names a folder. Put everything that matters into request: purpose, audience, structure, facts, numbers, tone, length/slide count. sources = his files to build from (any type: xlsx, csv, docx, pdf, txt…; max 5). Never overwrites anything.",
+    schema: z.object({
+      format: z.enum(["docx", "xlsx", "pptx", "pdf"]),
+      request: z.string().min(10).describe("A complete brief, including any facts from the conversation"),
+      filename: z.string().optional().describe("Name without extension, if he gave one"),
+      folder: z.string().optional(),
+      sources: z.array(z.string()).max(5).optional(),
+      open_when_ready: z.boolean().optional().describe("Open it as soon as it's done (when he says 'and open it')"),
+    }),
+    run: async ({ format, request, filename, folder, sources, open_when_ready }) => ({
+      result: await createDocument({ format, request, filename, folder, sources, openWhenReady: open_when_ready }),
+      activate: ["hub:docs"],
+    }),
+  }),
+  def({
     name: "list_skills",
     hub: "skills",
     description:
@@ -294,11 +511,12 @@ const TOOLS = [
   def({
     name: "open_url",
     hub: "web",
-    description: "Open a specific website in the browser (Firefox by default).",
+    description:
+      "Open a specific website in the browser (Firefox by default). Also opens a Windows Settings page directly with an ms-settings: link (ms-settings:display, ms-settings:bluetooth, ms-settings:sound, ms-settings:windowsupdate…).",
     schema: z.object({ url: z.string(), browser }),
     run: async ({ url, browser: b }) => {
       const r = await openUrl(url, b);
-      return { result: r, activate: [`web:${new URL(r.opened).hostname}`] };
+      return { result: r, activate: "app" in r ? ["hub:pc"] : [`web:${new URL(r.opened).hostname}`] };
     },
   }),
   def({
@@ -376,7 +594,7 @@ export async function runTool(
   name: string,
   input: unknown,
   ctx: ToolContext,
-): Promise<{ ok: boolean; result: unknown; activate: string[] }> {
+): Promise<{ ok: boolean; result: unknown; activate: string[]; image?: ToolImage }> {
   const tool = byName.get(name);
   if (!tool) return { ok: false, result: { error: `Unknown tool ${name}` }, activate: [] };
   const parsed = tool.schema.safeParse(input);
@@ -386,7 +604,7 @@ export async function runTool(
   const base = [`skill:${name}`, `hub:${tool.hub}`];
   try {
     const out = await tool.run(parsed.data, ctx);
-    if (isOutcome(out)) return { ok: true, result: out.result, activate: [...base, ...out.activate] };
+    if (isOutcome(out)) return { ok: true, result: out.result, activate: [...base, ...out.activate], image: out.image };
     return { ok: true, result: out, activate: base };
   } catch (err) {
     return { ok: false, result: { error: err instanceof Error ? err.message : String(err) }, activate: base };
