@@ -12,6 +12,8 @@ export type ChatEntry = {
   role: "user" | "assistant";
   text: string;
   tools: ToolChip[];
+  /** Which of SUNDAY's brains answered: "local", "Haiku" or "Opus". */
+  brain?: string;
   error?: string;
   interrupted?: boolean;
 };
@@ -345,6 +347,9 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
             case "text":
               patch((e) => ({ ...e, text: e.text + ev.delta }));
               if (speak) speakerRef.current?.feed(ev.delta);
+              break;
+            case "brain":
+              patch((e) => ({ ...e, brain: ev.label }));
               break;
             case "tool":
               patch((e) => {

@@ -14,11 +14,14 @@ import { browserSearch, openApplication, openPath, openUrl } from "./apps";
 import {
   createFolder,
   fileInfo,
+  FileToolError,
   listDirectory,
   moveItems,
   readTextFile,
   renameItem,
+  resolveUserPath,
   undoFileOperations,
+  uniqueTarget,
 } from "./files";
 import { editFile, openInVSCode, readCode, searchInFiles, vscodeWorkspaces, writeFile } from "./code";
 import {
@@ -34,8 +37,12 @@ import {
 } from "./system";
 import { logActivity } from "../db";
 import { createDraft, gmailAccount, readEmail, searchEmail, triageEmail } from "./gmail";
+import { BRAIN_LABEL, setBrainMode, type Brain } from "../brains";
+import { brainDiagnostics, repairBrain } from "../diagnostics";
 import { computerTask } from "../computer";
 import { createDocument } from "../documents";
+import { ASPECT_RATIOS, generateImage, saveImages, sirNamedPlace } from "../images";
+import { blenderImport, blenderLook, blenderRun, blenderSave, blenderScene, openBlender } from "../blender";
 import { cancelReminder, createReminder, listReminders, markBriefed, todaysReminders, weather } from "../reminders";
 
 export type ToolContext = {
@@ -44,6 +51,9 @@ export type ToolContext = {
   requestClient: <T>(kind: string, payload?: unknown) => Promise<T>;
   /** Fires when sir interrupts or sends something new. */
   signal?: AbortSignal;
+  /** Sir's own words this turn, and SUNDAY's reply before them — for tools that may act only on what he said. */
+  userText?: string;
+  lastReply?: string;
 };
 export type ToolImage = { data: string; mediaType: "image/jpeg" | "image/png" };
 export type ToolOutcome = { result: unknown; activate: string[]; image?: ToolImage };
@@ -146,6 +156,21 @@ const TOOLS = [
     schema: z.object({ path: z.string() }),
     run: async ({ path: p }) => {
       const r = await createFolder(p);
+      return { result: r, activate: [dirId(path.win32.dirname(r.path))] };
+    },
+  }),
+  def({
+    name: "create_text_file",
+    hub: "files",
+    description:
+      "Create a new plain-text file — a note, list or memo (.txt by default; .md, .csv, .json and .log also work). Its folder is created if missing. Never overwrites: a taken name gets ' (2)'. Undo removes it.",
+    schema: z.object({ path: z.string(), content: z.string().default("") }),
+    run: async ({ path: p, content }) => {
+      let target = resolveUserPath(p);
+      const ext = path.win32.extname(target).toLowerCase();
+      if (!ext) target += ".txt";
+      else if (!TEXT_FILE_TYPES.has(ext)) throw new FileToolError(`create_text_file only makes plain-text files (${[...TEXT_FILE_TYPES].join(", ")}).`);
+      const r = await writeFile(uniqueTarget(target), content, false);
       return { result: r, activate: [dirId(path.win32.dirname(r.path))] };
     },
   }),
@@ -273,7 +298,7 @@ const TOOLS = [
     name: "close_application",
     hub: "pc",
     description:
-      "Close an app's windows politely, like clicking X (e.g. 'close Spotify'). Apps with unsaved work will ask him to save. Never force-quits.",
+      "Close an app's windows politely, like clicking X (e.g. 'close Spotify'). Matches the app name or the window title, so a file's name closes the window showing it ('test123' closes the Notepad with test123.txt). Apps with unsaved work will ask him to save. Never force-quits.",
     schema: z.object({ name: z.string().min(2) }),
     run: async ({ name }) => closeApplication(name),
   }),
@@ -381,6 +406,139 @@ const TOOLS = [
       result: await createDocument({ format, request, filename, folder, sources, openWhenReady: open_when_ready }),
       activate: ["hub:docs"],
     }),
+  }),
+  def({
+    name: "generate_image",
+    hub: "images",
+    description:
+      "Generate images with Higgsfield from a text prompt (costs well under a cent each from sir's Higgsfield API balance; the tool checks the price first). Write a rich prompt: subject, setting, style, lighting, composition, mood. Runs in the background (usually under a minute); when ready SUNDAY opens a preview and asks him where to save it. This tool never saves anything into his folders — save_image does, once he names the place.",
+    schema: z.object({
+      prompt: z.string().min(3),
+      aspect_ratio: z.enum(ASPECT_RATIOS).optional().describe("16:9 wallpaper/landscape, 9:16 phone/story, 1:1 square/icon; default 4:3"),
+      count: z.number().int().min(1).max(4).optional().describe("How many variations (default 1)"),
+      high_res: z.boolean().optional().describe("1080p instead of 720p — only when he asks for high resolution"),
+    }),
+    run: async ({ prompt, aspect_ratio, count, high_res }) => ({
+      result: await generateImage({ prompt, aspectRatio: aspect_ratio, count, highRes: high_res }),
+      activate: ["hub:images"],
+    }),
+  }),
+  def({
+    name: "save_image",
+    hub: "images",
+    description:
+      "Save a generated image (the latest one waiting, or job) into the folder sir names. Only call it with a place he told you in this conversation — if he hasn't said where, ask him first and wait. Never overwrites; undo sets it aside.",
+    schema: z.object({
+      folder: z.string().min(1).describe("Exactly where he said, e.g. 'Desktop', 'Pictures\\\\Wallpapers', 'D:\\\\Art'"),
+      filename: z.string().optional().describe("Name without extension, if he gave one"),
+      job: z.string().optional().describe("Image job id, when several are waiting"),
+    }),
+    run: async ({ folder, filename, job }, ctx) => {
+      // He decides where images go — enforced here, not just asked for in the prompt.
+      if (!sirNamedPlace(folder, ctx.userText ?? "", ctx.lastReply ?? "")) {
+        throw new FileToolError(
+          `Not saved — sir hasn't said where (he never named "${folder}"). Reply with just this question: "Where would you like me to save it, sir? I can put it in Pictures\\SUNDAY Images if you like." Then save it where he says, or there if he says yes.`,
+        );
+      }
+      const r = await saveImages({ folder, filename, job });
+      return { result: r, activate: ["hub:images", dirId(path.win32.dirname(r.saved[0]))] };
+    },
+  }),
+  def({
+    name: "blender_open",
+    hub: "blender",
+    description:
+      "Open Blender (3D) with SUNDAY's bridge, or confirm it's already connected. Optionally open a .blend file. Call before any other blender_ tool.",
+    schema: z.object({ file: z.string().optional().describe("A .blend file to open") }),
+    run: async ({ file }) => ({ result: await openBlender(file), activate: ["hub:blender"] }),
+  }),
+  def({
+    name: "blender_scene",
+    hub: "blender",
+    description: "List what's in the open Blender scene: objects (type, position, size, materials, modifiers), collections and materials.",
+    schema: z.object({}),
+    run: async () => ({ result: await blenderScene(), activate: ["hub:blender"] }),
+  }),
+  def({
+    name: "blender_run_python",
+    hub: "blender",
+    description:
+      "Run Blender Python (bpy) in the open scene to build or change things: meshes, modifiers (subdivision, mirror, bevel, solidify), materials (Principled BSDF, emission), lights, cameras, parenting. bpy, bmesh, mathutils, math, Vector, Euler and Matrix are ready; print() output and a variable named result come back. Restricted: no file access, no bpy.ops.wm/file/export/script, no imports beyond Blender's and math modules. Work in small steps (one part per call), give every object a clear name and keep your work in a named collection. Undo works in Blender (Ctrl+Z).",
+    schema: z.object({
+      code: z.string().min(1),
+      what: z.string().describe("A few words on what this step does"),
+    }),
+    run: async ({ code }) => ({ result: await blenderRun(code), activate: ["hub:blender"] }),
+  }),
+  def({
+    name: "blender_look",
+    hub: "blender",
+    description:
+      "See the model: renders Blender's viewport from an angle and shows you the picture. Look after every significant step and fix what's off (proportions, gaps, intersections, materials) before moving on.",
+    schema: z.object({
+      view: z.enum(["three_quarter", "front", "side", "back", "top", "three_quarter_back"]).optional(),
+      objects: z.array(z.string()).optional().describe("Frame just these objects (default: everything visible)"),
+      shading: z.enum(["SOLID", "MATERIAL", "RENDERED"]).optional().describe("MATERIAL by default; SOLID to judge shape"),
+    }),
+    run: async ({ view, objects, shading }) => {
+      const r = await blenderLook({ view: view === "side" ? "right" : view, objects, shading });
+      return {
+        result: { view: r.view, framed: r.framed, picture: "attached" },
+        activate: ["hub:blender"],
+        image: { data: r.data, mediaType: "image/png" },
+      };
+    },
+  }),
+  def({
+    name: "blender_import",
+    hub: "blender",
+    description: "Import a 3D model file (glb, gltf, fbx, obj, stl) from sir's drives into the open Blender scene.",
+    schema: z.object({ path: z.string() }),
+    run: async ({ path: p }) => ({ result: await blenderImport(p), activate: ["hub:blender"] }),
+  }),
+  def({
+    name: "blender_save",
+    hub: "blender",
+    description:
+      "Save the Blender scene as a new .blend file in the folder sir names (ask him where if he hasn't said). Never overwrites — a taken name gets ' (2)'.",
+    schema: z.object({ folder: z.string(), name: z.string().describe("File name without .blend") }),
+    run: async ({ folder, name }) => {
+      const r = await blenderSave(folder, name);
+      return { result: r, activate: ["hub:blender", dirId(path.win32.dirname(String(r.saved)))] };
+    },
+  }),
+  def({
+    name: "brain_status",
+    hub: "brains",
+    description:
+      "SUNDAY's self-diagnostics: which brains exist and which models they are, whether each is reachable and working, the local model's GPU/VRAM state, brain mode, recent failures, GPU, disks, voice, ears, Voice ID, Gmail — plus a list of problems with fixes. Use it when sir asks how you're doing technically, what's wrong, why something is slow or failing, or for a health check. test=true also sends each brain a tiny test message (a fraction of a cent).",
+    schema: z.object({ test: z.boolean().optional() }),
+    run: async ({ test }) => ({ result: await brainDiagnostics({ test: test ?? false }), activate: ["hub:brains"] }),
+  }),
+  def({
+    name: "set_brain_mode",
+    hub: "brains",
+    description:
+      "Switch which brain answers from sir's next message on: auto (SUNDAY picks the cheapest capable brain per message — the default), local (the free model on his GPU), fast (Claude Haiku) or deep (Claude Opus). Use when he says things like 'switch to Opus', 'use the local brain', 'go back to automatic'. A pinned brain still hands up requests it can't do (e.g. the local brain can't read email).",
+    schema: z.object({ mode: z.enum(["auto", "local", "fast", "deep"]) }),
+    run: async ({ mode }) => {
+      setBrainMode(mode);
+      return {
+        result: {
+          mode,
+          note: mode === "auto" ? "Automatic from the next message." : `Pinned to the ${BRAIN_LABEL[mode as Brain]} brain from the next message.`,
+        },
+        activate: ["hub:brains"],
+      };
+    },
+  }),
+  def({
+    name: "repair_brain",
+    hub: "brains",
+    description:
+      "Fix brain problems found by brain_status: reload_local (rebuild SUNDAY's local model and load it into the GPU), unload_local (free ~10 GB of GPU memory, e.g. before games or Blender — it reloads when needed), start_ollama (start Ollama if it isn't running; won't end stuck copies — sir does that), reset_brain_mode (back to automatic). Run brain_status again afterwards to confirm.",
+    schema: z.object({ action: z.enum(["reload_local", "unload_local", "start_ollama", "reset_brain_mode"]) }),
+    run: async ({ action }) => ({ result: await repairBrain(action), activate: ["hub:brains"] }),
   }),
   def({
     name: "list_skills",
@@ -568,21 +726,60 @@ export function toolHub(name: string) {
   return byName.get(name)?.hub ?? "skills";
 }
 
-export function toolSchemas(): Anthropic.Beta.BetaToolUnion[] {
-  const custom = TOOLS.map((t) => {
+/** The everyday tools the local brain gets — small models get confused by ~50. */
+const TEXT_FILE_TYPES = new Set([".txt", ".md", ".csv", ".json", ".log"]);
+
+const LOCAL_TOOLS = new Set([
+  "remember", "recall", "search_files", "list_directory", "create_folder", "create_text_file",
+  "open_application", "open_path", "open_url", "browser_search", "close_application", "save_image",
+  "media_control", "volume", "system_status", "lock_pc", "show_desktop",
+  "set_reminder", "set_timer", "list_reminders", "cancel_reminder", "get_weather", "morning_briefing",
+  "brain_status", "set_brain_mode", "repair_brain",
+]);
+/** Only the deep brain drives the computer or edits code. */
+const DEEP_ONLY = new Set(["computer_task", "edit_file", "write_file", "use_skill", "blender_run_python", "blender_look", "blender_import"]);
+
+/** Not a real tool: the local and fast brains call it to pass a request up. */
+export const HAND_OFF = "hand_off";
+
+export function toolSchemas(brain: Brain = "deep"): Anthropic.Beta.BetaToolUnion[] {
+  const offered = TOOLS.filter((t) =>
+    brain === "deep" ? true : brain === "local" ? LOCAL_TOOLS.has(t.name) : !DEEP_ONLY.has(t.name),
+  );
+  const custom = offered.map((t) => {
     const { $schema: _ignored, ...schema } = z.toJSONSchema(t.schema) as Record<string, unknown>;
     return {
       name: t.name,
       description: t.description,
       input_schema: schema as Anthropic.Beta.BetaTool.InputSchema,
-      eager_input_streaming: true,
+      // Ollama doesn't know this field; Claude streams big inputs faster with it.
+      ...(brain === "local" ? {} : { eager_input_streaming: true }),
     } satisfies Anthropic.Beta.BetaTool;
   });
+  if (brain === "deep") {
+    return [
+      ...custom,
+      { type: "web_search_20260209", name: "web_search", max_uses: 3 } as Anthropic.Beta.BetaToolUnion,
+      // Lets her read documentation pages a skill points to (only URLs already in the conversation).
+      { type: "web_fetch_20260209", name: "web_fetch", max_uses: 5 } as Anthropic.Beta.BetaToolUnion,
+    ];
+  }
+  const handOff: Anthropic.Beta.BetaTool = {
+    name: HAND_OFF,
+    description:
+      brain === "local"
+        ? "Pass this request to SUNDAY's stronger brain. Call it right away — before saying anything — when the request needs a tool you don't have (web search, email, the screen, moving or renaming files, documents, coding, using the computer), takes several careful steps, or you're unsure you'd get it right."
+        : "Pass this request to SUNDAY's strongest brain. Call it right away — before saying anything — for coding or editing code, using the computer (mouse and keyboard), loading expert skills, or anything that needs deep reasoning you're not confident about.",
+    input_schema: {
+      type: "object",
+      properties: { reason: { type: "string", description: "A few words on why" } },
+      required: ["reason"],
+    },
+  };
   return [
     ...custom,
-    { type: "web_search_20260209", name: "web_search", max_uses: 3 } as Anthropic.Beta.BetaToolUnion,
-    // Lets her read documentation pages a skill points to (only URLs already in the conversation).
-    { type: "web_fetch_20260209", name: "web_fetch", max_uses: 5 } as Anthropic.Beta.BetaToolUnion,
+    handOff,
+    ...(brain === "fast" ? [{ type: "web_search_20250305", name: "web_search", max_uses: 3 } as Anthropic.Beta.BetaToolUnion] : []),
   ];
 }
 

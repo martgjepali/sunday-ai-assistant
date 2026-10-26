@@ -3,7 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { MEMORY_MODEL } from "./config";
+import { MEMORY_MODEL, supportsFallbacks } from "./config";
 import { db, ftsQuery } from "./db";
 
 export const MEMORY_CATEGORIES = [
@@ -207,7 +207,9 @@ export function searchPastConversations(query: string, excludeConversation?: str
 const Extraction = z.object({
   title: z
     .string()
-    .describe("A 2-5 word title for this conversation, or an empty string to keep the current one."),
+    .describe(
+      "A 2-5 word title for this conversation. Always give one when the current title is '(untitled)'; otherwise an empty string keeps the current title.",
+    ),
   memories: z.array(
     z.object({
       content: z
@@ -236,8 +238,9 @@ export async function reflectOnExchange(conversationId: string, userText: string
     model: MEMORY_MODEL,
     max_tokens: 4000,
     output_config: { effort: "low", format: betaZodOutputFormat(Extraction) },
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
+    ...(supportsFallbacks(MEMORY_MODEL)
+      ? { betas: ["server-side-fallback-2026-07-01"] as Anthropic.AnthropicBeta[], fallbacks: "default" as const }
+      : {}),
     system:
       "You maintain the long-term memory of SUNDAY, a personal AI assistant. From the latest exchange, " +
       "extract only durable facts worth remembering weeks from now: who the user is, people in their life, " +

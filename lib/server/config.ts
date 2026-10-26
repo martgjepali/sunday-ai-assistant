@@ -15,8 +15,29 @@ export const EFFORT = (process.env.SUNDAY_EFFORT ?? "low") as
   | "high"
   | "xhigh"
   | "max";
-/** Model for background memory extraction and conversation titles. */
-export const MEMORY_MODEL = process.env.SUNDAY_MEMORY_MODEL ?? MODEL;
+/** Middle brain: quick, cheap Claude for multi-step everyday work. */
+export const FAST_MODEL = process.env.SUNDAY_FAST_MODEL ?? "claude-haiku-5-5";
+/** Everyday brain on sir's GPU, served by Ollama. Created from the base model with a bigger context. */
+export const LOCAL_BASE_MODEL = process.env.SUNDAY_LOCAL_BASE_MODEL ?? "qwen3:14b";
+export const LOCAL_MODEL = process.env.SUNDAY_LOCAL_MODEL ?? "sunday-local";
+export const LOCAL_CONTEXT = Number(process.env.SUNDAY_LOCAL_CONTEXT ?? 8192);
+/** How long the local model stays loaded in GPU memory after use (frees ~10 GB of VRAM when it lapses). */
+export const LOCAL_KEEP_ALIVE = process.env.SUNDAY_LOCAL_KEEP_ALIVE ?? "30m";
+export const OLLAMA_URL = (process.env.SUNDAY_OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+/** Model for background memory extraction and conversation titles — runs after every reply, so keep it cheap. */
+export const MEMORY_MODEL = process.env.SUNDAY_MEMORY_MODEL ?? FAST_MODEL;
+
+/** Higgsfield image model endpoint (owner/model/variant) and the most one request may cost. */
+export const IMAGE_MODEL = (process.env.SUNDAY_IMAGE_MODEL ?? "higgsfield-ai/soul/v2/standard").replace(/^\/+|\/+$/g, "");
+export const IMAGE_MAX_USD = Number(process.env.SUNDAY_IMAGE_MAX_USD ?? 1);
+/** Open a finished image straight away so sir can see it before choosing where it goes. */
+export const IMAGE_PREVIEW = process.env.SUNDAY_IMAGE_PREVIEW !== "off";
+export const HIGGSFIELD_URL = (process.env.SUNDAY_HIGGSFIELD_URL ?? "https://api.higgsfield.ai").replace(/\/+$/, "");
+
+/** Haiku has no server-side fallback; sending `fallbacks` to it is an error. */
+export function supportsFallbacks(model: string) {
+  return !/haiku/i.test(model);
+}
 
 export const HOME = os.homedir();
 
@@ -35,6 +56,7 @@ export const features = {
   deepgram: () => Boolean(process.env.DEEPGRAM_API_KEY),
   google: () =>
     Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+  higgsfield: () => Boolean(process.env.HF_CREDENTIALS?.includes(":")),
 };
 
 export function appOrigin(): string {

@@ -48,6 +48,9 @@ const HUBS: Record<string, string> = {
   screen: "Screen",
   pc: "PC",
   docs: "Documents",
+  images: "Images",
+  blender: "Blender",
+  brains: "Brains",
 };
 
 const SKIP_DIRS = /^(\$|system volume information$|windows$|program files|programdata$|recovery$|perflogs$|config\.msi$|msocache$|boot$|documents and settings$|onedrivetemp$)/i;

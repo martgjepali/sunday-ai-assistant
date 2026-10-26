@@ -1,5 +1,6 @@
 import { connection } from "next/server";
-import { EFFORT, MODEL, driveRoots, features } from "@/lib/server/config";
+import { brainMode, localBrainStatus } from "@/lib/server/brains";
+import { EFFORT, FAST_MODEL, LOCAL_BASE_MODEL, MODEL, driveRoots, features } from "@/lib/server/config";
 import { indexerStatus } from "@/lib/server/indexer";
 import { gmailAccount } from "@/lib/server/tools/gmail";
 import { typesafeEnabled } from "@/lib/server/typesafe";
@@ -11,6 +12,7 @@ export async function GET() {
     model: MODEL,
     effort: EFFORT,
     brain: features.anthropic(),
+    brains: { mode: brainMode(), local: { ...(await localBrainStatus()), model: LOCAL_BASE_MODEL }, fast: FAST_MODEL },
     drives: driveRoots(),
     index: indexerStatus(),
     voice: voiceStatus(),

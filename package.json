@@ -16,6 +16,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
     "@elevenlabs/elevenlabs-js": "^2.74.0",
+    "@higgsfield/client": "^0.2.6",
     "3d-force-graph": "^1.80.1",
     "dotenv": "^18.0.9",
     "next": "16.4.2",

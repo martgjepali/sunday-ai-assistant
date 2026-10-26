@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import type { VoiceState } from "@/lib/client/useSunday";
+import { Avatar } from "./Avatar";
 
 const STATE_LABEL: Record<VoiceState, string> = {
   standby: "Standby",
@@ -23,9 +24,12 @@ type Props = {
   model: string;
   wakeReady: boolean;
   onToggle: () => void;
+  /** Show SUNDAY's 3D body instead of the orb. */
+  body: boolean;
+  onBodyChange: (body: boolean) => void;
 };
 
-export function Orb({ state, level, model, wakeReady, onToggle }: Props) {
+export function Orb({ state, level, model, wakeReady, onToggle, body, onBodyChange }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -33,6 +37,7 @@ export function Orb({ state, level, model, wakeReady, onToggle }: Props) {
   levelRef.current = level;
 
   useEffect(() => {
+    if (body) return;
     const el = canvas.current!;
     const ctx = el.getContext("2d")!;
     let raf = 0;
@@ -43,6 +48,11 @@ export function Orb({ state, level, model, wakeReady, onToggle }: Props) {
     const draw = (now: number) => {
       const dpr = window.devicePixelRatio || 1;
       const size = el.clientWidth;
+      if (size < 80) {
+        // Not laid out yet — drawing now would ask for negative arc radii.
+        raf = requestAnimationFrame(draw);
+        return;
+      }
       if (el.width !== size * dpr) {
         el.width = size * dpr;
         el.height = size * dpr;
@@ -138,16 +148,16 @@ export function Orb({ state, level, model, wakeReady, onToggle }: Props) {
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [body]);
 
   return (
-    <div className="orb">
+    <div className="orb" data-body={body || undefined}>
       <button
         className="orb-face"
         onClick={onToggle}
         aria-label={state === "speaking" ? "Stop speaking" : state === "standby" ? "Talk to SUNDAY" : "Stop listening"}
       >
-        <canvas ref={canvas} />
+        {body ? <Avatar state={state} level={level} onFail={() => onBodyChange(false)} /> : <canvas ref={canvas} />}
       </button>
       <div className="orb-state" data-state={state}>
         <span className="orb-dot" />
@@ -156,6 +166,9 @@ export function Orb({ state, level, model, wakeReady, onToggle }: Props) {
       <div className="orb-meta">
         <span className="chip chip-accent">◆ {model}</span>
         {wakeReady && <span className="chip">“Hey Sunday”</span>}
+        <button className="chip chip-button" onClick={() => onBodyChange(!body)} aria-pressed={body}>
+          {body ? "Orb" : "Body"}
+        </button>
       </div>
     </div>
   );

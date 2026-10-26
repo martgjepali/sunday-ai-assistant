@@ -192,7 +192,7 @@ export async function listDirectory(input: string, limit = 150) {
         name: e.name,
         type: e.isDirectory() ? "folder" : "file",
         size: st && !e.isDirectory() ? fmtSize(st.size) : undefined,
-        modified: st ? st.mtime.toISOString().slice(0, 16).replace("T", " ") : undefined,
+        modified: st ? localStamp(st.mtime) : undefined,
       };
     }),
   );
@@ -206,6 +206,12 @@ export async function listDirectory(input: string, limit = 150) {
   };
 }
 
+/** "2026-10-26 22:32" in sir's own time zone — UTC stamps get misread as local. */
+function localStamp(d: Date) {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 export async function fileInfo(input: string) {
   const p = resolveUserPath(input);
   assertOnAllowedDrive(p);
@@ -215,8 +221,8 @@ export async function fileInfo(input: string) {
   const info: Record<string, unknown> = {
     path: p,
     type: st.isDirectory() ? "folder" : "file",
-    created: st.birthtime.toISOString(),
-    modified: st.mtime.toISOString(),
+    created: localStamp(st.birthtime),
+    modified: localStamp(st.mtime),
   };
   if (st.isDirectory()) {
     const children = await fs.readdir(p).catch(() => []);

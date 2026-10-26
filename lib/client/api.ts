@@ -66,10 +66,13 @@ export async function* streamChat(
   }
 }
 
+export type BrainMode = "auto" | "local" | "fast" | "deep";
+
 export type SystemStatus = {
   model: string;
   effort: string;
   brain: boolean;
+  brains: { mode: BrainMode; local: { model: string; ready: boolean; reason?: string }; fast: string };
   drives: string[];
   index: Record<string, { state: string; count: number; finishedAt?: number }>;
   voice: { elevenlabs: boolean; voiceId: string | null; sample: boolean };

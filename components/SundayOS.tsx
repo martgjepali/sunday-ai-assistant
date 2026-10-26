@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { getJSON, type BrainData, type SystemStatus } from "@/lib/client/api";
+import { api, getJSON, type BrainData, type BrainMode, type SystemStatus } from "@/lib/client/api";
 import { useSunday, type ChatEntry, type IdentityState } from "@/lib/client/useSunday";
 import { VoiceEnroll } from "./VoiceEnroll";
 import { BootSequence } from "./BootSequence";
@@ -29,6 +29,15 @@ export function SundayOS() {
   const [path, setPath] = useState<string[] | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [repel, setRepel] = useState(90);
+  /** SUNDAY's 3D body in place of the orb — on unless he switched it off. */
+  const [body, setBody] = useState(false);
+  useEffect(() => {
+    try {
+      setBody(localStorage.getItem("sunday.body") !== "off");
+    } catch {
+      setBody(true);
+    }
+  }, []);
   const [linkLength, setLinkLength] = useState(38);
   const [showLabels, setShowLabels] = useState(true);
   const [ambient, setAmbient] = useState(true);
@@ -166,6 +175,13 @@ export function SundayOS() {
           model={sunday.status?.model ?? "…"}
           wakeReady={Boolean(sunday.status?.wake.ready)}
           onToggle={sunday.toggleSession}
+          body={body}
+          onBodyChange={(on) => {
+            setBody(on);
+            try {
+              localStorage.setItem("sunday.body", on ? "on" : "off");
+            } catch {}
+          }}
         />
 
         <SystemsPanel
@@ -439,6 +455,19 @@ const IDENTITY_TEXT: Record<IdentityState, string> = {
   denied: "stranger refused",
 };
 
+const BRAIN_MODES: [BrainMode, string][] = [
+  ["auto", "Auto"],
+  ["local", "Local"],
+  ["fast", "Haiku"],
+  ["deep", "Opus"],
+];
+const BRAIN_MODE_TEXT: Record<BrainMode, string> = {
+  auto: "picks per message",
+  local: "local first · free",
+  fast: "Haiku first",
+  deep: "Opus first",
+};
+
 function SystemsPanel({
   status,
   isDesktop,
@@ -451,6 +480,13 @@ function SystemsPanel({
   onVoiceSetup: () => void;
 }) {
   const [autoStart, setAutoStart] = useState<boolean | null>(null);
+  // A click shows at once; the next status poll (which also catches voice switches) is the truth.
+  const [picked, setPicked] = useState<{ mode: BrainMode; on: SystemStatus | null } | null>(null);
+  const brainMode = picked && picked.on === status ? picked.mode : status?.brains.mode ?? "auto";
+  const pickBrain = (mode: BrainMode) => {
+    setPicked({ mode, on: status });
+    void api("/api/brains", { method: "POST", body: JSON.stringify({ mode }) }).catch(() => setPicked(null));
+  };
   useEffect(() => {
     if (isDesktop) void window.sundayDesktop?.getAutoStart().then(setAutoStart);
   }, [isDesktop]);
@@ -458,6 +494,13 @@ function SystemsPanel({
   if (!status) return <section className="panel systems" aria-busy />;
   const rows: { name: string; ok: boolean | "partial"; value: string; action?: ReactNode }[] = [
     { name: "Core", ok: status.brain, value: status.brain ? `${status.model} · ${status.effort}` : "ANTHROPIC_API_KEY missing" },
+    {
+      name: "Local brain",
+      ok: status.brains.local.ready ? true : "partial",
+      value: status.brains.local.ready
+        ? `${status.brains.local.model} · free · Haiku backup`
+        : `${status.brains.local.reason ?? "off"} — using Haiku`,
+    },
     {
       name: "Voice",
       ok: status.voice.elevenlabs ? true : "partial",
@@ -510,6 +553,25 @@ function SystemsPanel({
             {r.action}
           </li>
         ))}
+        <li className="brain-row">
+          <span className="sys-led" data-ok="true" />
+          <span className="sys-name">Brain</span>
+          <span className="sys-value">{BRAIN_MODE_TEXT[brainMode]}</span>
+          <span className="brain-switch" role="radiogroup" aria-label="Which brain answers">
+            {BRAIN_MODES.map(([mode, label]) => (
+              <button
+                key={mode}
+                role="radio"
+                aria-checked={brainMode === mode}
+                data-active={brainMode === mode}
+                title={mode === "auto" ? "SUNDAY picks the cheapest brain that can do the job" : `Always start with ${label}`}
+                onClick={() => pickBrain(mode)}
+              >
+                {label}
+              </button>
+            ))}
+          </span>
+        </li>
         <li>
           <span className="sys-led" data-ok={String(Object.values(status.index).every((d) => d.state === "done"))} />
           <span className="sys-name">Drives</span>
@@ -543,6 +605,15 @@ const TOOL_NAMES: Record<string, string> = {
   file_info: "checking file",
   read_file: "reading file",
   create_folder: "creating folder",
+  create_text_file: "writing note",
+  generate_image: "generating image",
+  save_image: "saving image",
+  blender_open: "opening Blender",
+  blender_scene: "reading the scene",
+  blender_run_python: "building in Blender",
+  blender_look: "looking at the model",
+  blender_import: "importing model",
+  blender_save: "saving .blend",
   move_items: "moving",
   rename_item: "renaming",
   undo_file_operations: "undoing",
@@ -567,6 +638,9 @@ const TOOL_NAMES: Record<string, string> = {
   email_triage: "triaging inbox",
   look_at_screen: "looking at your screen",
   create_document: "creating document",
+  brain_status: "running diagnostics",
+  set_brain_mode: "switching brain",
+  repair_brain: "repairing brain",
   computer_task: "using the computer",
   media_control: "controlling media",
   volume: "adjusting volume",
@@ -626,8 +700,13 @@ function Dock(p: {
 
       {(p.reply || p.interim) && (
         <div className="caption panel">
-          {p.reply && p.reply.tools.length > 0 && (
+          {p.reply && (p.reply.tools.length > 0 || p.reply.brain) && (
             <div className="tool-chips">
+              {p.reply.brain && (
+                <span className="tool-chip" data-status="brain" title="Which brain answered">
+                  {p.reply.brain} brain
+                </span>
+              )}
               {p.reply.tools.map((t) => (
                 <span key={t.id} className="tool-chip" data-status={t.status} title={t.detail}>
                   {TOOL_NAMES[t.name] ?? t.name.replace(/_/g, " ")}
@@ -737,7 +816,7 @@ function HistoryDrawer(p: {
           {p.entries.length === 0 && <p className="hint">Nothing said yet. Say “Hey Sunday” or type below.</p>}
           {p.entries.map((e) => (
             <div key={e.id} className="msg" data-role={e.role}>
-              <span className="msg-who">{e.role === "user" ? "You" : "SUNDAY"}</span>
+              <span className="msg-who">{e.role === "user" ? "You" : e.brain ? `SUNDAY · ${e.brain}` : "SUNDAY"}</span>
               <p>{e.text || (e.error ? "" : "…")}</p>
               {e.error && <p className="caption-error">{e.error}</p>}
             </div>
