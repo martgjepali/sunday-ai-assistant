@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { SpeakerEmbeddingExtractor } from "sherpa-onnx-node";
-import { kvGet, kvSet, logActivity } from "./db";
+import { db, kvGet, kvSet, logActivity } from "./db";
 
 /**
  * Voice ID: SUNDAY recognises sir by voice, fully offline. Each utterance is
@@ -32,7 +32,7 @@ const g = globalThis as unknown as {
   __sundaySpeaker?: {
     extractor: SpeakerEmbeddingExtractor | null;
     pending: number[][];
-    tokens: Map<string, number>;
+    tokens: Map<string, { exp: number; similarity: number }>;
     ownerHeardAt: number;
   };
 };
@@ -109,7 +109,7 @@ export function verify(samples: Float32Array) {
   if (isOwner) {
     state.ownerHeardAt = Date.now();
     token = randomBytes(16).toString("hex");
-    state.tokens.set(token, Date.now() + TOKEN_TTL_MS);
+    state.tokens.set(token, { exp: Date.now() + TOKEN_TTL_MS, similarity });
   } else {
     logActivity("security", "Voice not recognised", similarity.toFixed(2));
   }
@@ -120,16 +120,38 @@ export function verify(samples: Float32Array) {
  * Gate for /api/chat. Voice requests need a fresh single-use token from
  * verify(); typed requests need sir's voice to have been heard recently.
  */
-export function allowChat(mode: "voice" | "text", token?: string | null): boolean {
-  if (!ownerVoice()) return true;
+/** How a request got through the gate — told to SUNDAY so she can explain it. */
+export type ChatSecurity =
+  | { ok: false }
+  | { ok: true; via: "off" }
+  | { ok: true; via: "voice"; similarity: number }
+  | { ok: true; via: "recent-voice"; heardAgoMin: number };
+
+export function allowChat(mode: "voice" | "text", token?: string | null): ChatSecurity {
+  if (!ownerVoice()) return { ok: true, via: "off" };
   const now = Date.now();
-  for (const [t, exp] of state.tokens) if (exp < now) state.tokens.delete(t);
-  if (token && state.tokens.has(token)) {
+  for (const [t, v] of state.tokens) if (v.exp < now) state.tokens.delete(t);
+  const pass = token ? state.tokens.get(token) : undefined;
+  if (token && pass) {
     state.tokens.delete(token);
-    return true;
+    return { ok: true, via: "voice", similarity: Math.round(pass.similarity * 100) / 100 };
   }
-  return mode === "text" && now - state.ownerHeardAt < TEXT_GRACE_MS;
+  if (mode === "text" && now - state.ownerHeardAt < TEXT_GRACE_MS) {
+    return { ok: true, via: "recent-voice", heardAgoMin: Math.round((now - state.ownerHeardAt) / 60_000) };
+  }
+  return { ok: false };
 }
+
+/** Voices refused recently, so SUNDAY can mention attempts while sir was away. */
+export function recentRefusals(hours = 24): { count: number; lastAt: number | null } {
+  const since = Date.now() - hours * 3_600_000;
+  const row = db()
+    .prepare("SELECT COUNT(*) AS n, MAX(created_at) AS last FROM activity WHERE kind = 'security' AND label = 'Voice not recognised' AND created_at >= ?")
+    .get(since) as { n: number; last: number | null };
+  return { count: row.n, lastAt: row.last };
+}
+
+export const voiceThreshold = () => THRESHOLD;
 
 export const ownerRecentlyHeard = (withinMs = 5 * 60 * 1000) => Date.now() - state.ownerHeardAt < withinMs;
 

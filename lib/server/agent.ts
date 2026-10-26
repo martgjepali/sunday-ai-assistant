@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { EFFORT, MODEL } from "./config";
 import { addMessage, conversationHistory, reflectOnExchange } from "./memory";
 import { PERSONA, dynamicContext } from "./persona";
+import type { ChatSecurity } from "./speaker";
 import { runTool, toolHub, toolSchemas } from "./tools";
 
 export type AgentEvent =
@@ -21,16 +22,17 @@ export async function runAgent(opts: {
   conversationId: string;
   userText: string;
   mode: "voice" | "text";
+  security: ChatSecurity;
   signal: AbortSignal;
   emit: (e: AgentEvent) => void;
 }) {
-  const { conversationId, userText, mode, signal, emit } = opts;
+  const { conversationId, userText, mode, security, signal, emit } = opts;
   client ??= new Anthropic();
 
   const history = conversationHistory(conversationId);
   addMessage(conversationId, "user", userText);
 
-  const ctx = dynamicContext(userText, mode);
+  const ctx = dynamicContext(userText, mode, security);
   emit({ type: "activate", ids: ["sunday", "hub:memory", ...ctx.activated] });
 
   const tools = toolSchemas();

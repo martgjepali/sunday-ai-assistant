@@ -172,7 +172,11 @@ export function SundayOS() {
           status={sunday.status}
           isDesktop={isDesktop}
           identity={sunday.identity}
-          onVoiceSetup={() => setEnrollOpen(true)}
+          onVoiceSetup={() => {
+            // SUNDAY stops listening so the enrollment sentences aren't taken as commands.
+            sunday.pauseListening(true);
+            setEnrollOpen(true);
+          }}
         />
       </aside>
 
@@ -201,7 +205,13 @@ export function SundayOS() {
 
       {isDesktop && <WindowControls />}
       {enrollOpen && (
-        <VoiceEnroll onClose={() => setEnrollOpen(false)} onSaved={() => void sunday.reloadIdentity()} />
+        <VoiceEnroll
+          onClose={() => {
+            setEnrollOpen(false);
+            sunday.pauseListening(false);
+          }}
+          onSaved={() => void sunday.reloadIdentity()}
+        />
       )}
       {sunday.locked && (
         <div className="lock-screen" role="alert">

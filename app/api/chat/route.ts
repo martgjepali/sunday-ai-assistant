@@ -16,7 +16,8 @@ export async function POST(req: Request) {
   if (!parsed.success) return Response.json({ error: "Bad request" }, { status: 400 });
   const { text, mode } = parsed.data;
   // Voice ID: only sir gets through, whatever the UI does.
-  if (!allowChat(mode, parsed.data.voiceToken)) {
+  const security = allowChat(mode, parsed.data.voiceToken);
+  if (!security.ok) {
     return Response.json({ error: "not-owner" }, { status: 403 });
   }
   const conversationId = ensureConversation(parsed.data.conversationId);
@@ -35,7 +36,7 @@ export async function POST(req: Request) {
       };
       emit({ type: "meta", conversationId });
       try {
-        await runAgent({ conversationId, userText: text, mode, signal: req.signal, emit });
+        await runAgent({ conversationId, userText: text, mode, security, signal: req.signal, emit });
       } catch (err) {
         console.error("[sunday] chat failed:", err);
         emit({ type: "error", message: describeError(err) });

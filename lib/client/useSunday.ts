@@ -70,6 +70,8 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
   /* ───────── Security: Windows lock + Face ID ───────── */
   const [locked, setLocked] = useState(false);
   const lockedRef = useRef(false);
+  /** True while something else owns the mic (Voice ID enrollment): SUNDAY must not act on what she hears. */
+  const pausedRef = useRef(false);
   const [identity, setIdentity] = useState<IdentityState>("off");
   const enrolledRef = useRef(false);
 
@@ -225,7 +227,7 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
 
   const startSession = useCallback(async () => {
     speakerRef.current?.unlock();
-    if (sessionRef.current) return;
+    if (sessionRef.current || pausedRef.current) return;
     if (lockedRef.current) {
       setNotice("SUNDAY is locked. Unlock Windows to continue.");
       return;
@@ -260,10 +262,23 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     earRef.current?.stop();
     setInterim("");
     chime("sleep");
-    if (!lockedRef.current) void wakeRef.current?.resume().catch(() => {});
+    if (!lockedRef.current && !pausedRef.current) void wakeRef.current?.resume().catch(() => {});
     if (!inFlightRef.current && !speakerRef.current?.speaking) setState("standby");
   }, []);
   endSessionRef.current = endSession;
+
+  /** Stop all listening (wake word + conversation) until resumed, e.g. during Voice ID enrollment. */
+  const pauseListening = useCallback((on: boolean) => {
+    pausedRef.current = on;
+    if (on) {
+      inFlightRef.current?.abort();
+      speakerRef.current?.stop();
+      endSessionRef.current();
+      void wakeRef.current?.pause().catch(() => {});
+    } else if (!lockedRef.current && !sessionRef.current) {
+      void wakeRef.current?.resume().catch(() => {});
+    }
+  }, []);
 
   const send = useCallback(
     async (text: string, mode: "voice" | "text", voiceToken?: string | null) => {
@@ -474,5 +489,6 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     locked,
     identity,
     reloadIdentity: loadIdentity,
+    pauseListening,
   };
 }
