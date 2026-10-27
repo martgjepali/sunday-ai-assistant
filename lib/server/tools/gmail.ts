@@ -8,13 +8,16 @@ import { FileToolError } from "./files";
 /**
  * Gmail access is read + compose only. SUNDAY can search and read mail and
  * create drafts; there is intentionally no send function in this codebase.
+ * The same Google sign-in covers Calendar (events only — see ../calendar.ts).
  */
+export const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events";
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
   "https://www.googleapis.com/auth/gmail.compose",
+  CALENDAR_SCOPE,
 ];
 
-type Tokens = { access_token: string; refresh_token?: string; expires_at: number; email?: string };
+type Tokens = { access_token: string; refresh_token?: string; expires_at: number; email?: string; scope?: string };
 
 export const redirectUri = () => `${appOrigin()}/api/google/callback`;
 
@@ -51,11 +54,12 @@ export async function completeGoogleAuth(code: string, state: string) {
     }),
   });
   if (!res.ok) throw new Error(`Google rejected the sign-in (${res.status}).`);
-  const body = (await res.json()) as { access_token: string; refresh_token?: string; expires_in: number };
+  const body = (await res.json()) as { access_token: string; refresh_token?: string; expires_in: number; scope?: string };
   const tokens: Tokens = {
     access_token: body.access_token,
     refresh_token: body.refresh_token,
     expires_at: Date.now() + (body.expires_in - 60) * 1000,
+    scope: body.scope,
   };
   kvSet("google_tokens", tokens);
   const profile = await gmail<{ emailAddress: string }>("profile");
@@ -69,7 +73,13 @@ export function gmailAccount(): string | null {
   return t?.refresh_token ? (t.email ?? "connected") : null;
 }
 
-async function accessToken(): Promise<string> {
+/** Did sir grant this Google permission? (Sign-ins from before SUNDAY recorded scopes count as no.) */
+export function googleHas(scope: string) {
+  const t = kvGet<Tokens>("google_tokens");
+  return Boolean(t?.refresh_token && t.scope?.split(" ").includes(scope));
+}
+
+export async function googleAccessToken(): Promise<string> {
   const t = kvGet<Tokens>("google_tokens");
   if (!t?.refresh_token) {
     throw new FileToolError("Gmail isn't connected yet. Sir can connect it from the Systems panel.");
@@ -95,7 +105,7 @@ async function gmail<T>(pathAndQuery: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${pathAndQuery}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${await accessToken()}`,
+      Authorization: `Bearer ${await googleAccessToken()}`,
       "Content-Type": "application/json",
       ...init?.headers,
     },

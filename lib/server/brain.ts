@@ -49,6 +49,9 @@ const HUBS: Record<string, string> = {
   pc: "PC",
   docs: "Documents",
   images: "Images",
+  calendar: "Calendar",
+  lists: "Lists",
+  routines: "Routines",
   blender: "Blender",
   brains: "Brains",
 };

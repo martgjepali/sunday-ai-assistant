@@ -338,6 +338,8 @@ app.whenReady().then(async () => {
   ipcMain.handle("agent:drive", (_e, on) => (on ? startDriving() : stopDriving()));
   ipcMain.handle("autostart:get", () => app.getLoginItemSettings(loginArgs()).openAtLogin);
   ipcMain.handle("autostart:set", (_e, on) => setAutoStart(Boolean(on)));
+  // Seconds since sir last touched the mouse or keyboard (a locked PC counts as away).
+  ipcMain.handle("idle:get", () => (powerMonitor.getSystemIdleState(60) === "locked" ? 86_400 : powerMonitor.getSystemIdleTime()));
 
   await startServer();
   if (!(await waitForServer())) {

@@ -3,6 +3,8 @@ import { brainMode, localBrainStatus } from "@/lib/server/brains";
 import { EFFORT, FAST_MODEL, LOCAL_BASE_MODEL, MODEL, driveRoots, features } from "@/lib/server/config";
 import { indexerStatus } from "@/lib/server/indexer";
 import { gmailAccount } from "@/lib/server/tools/gmail";
+import { calendarReady } from "@/lib/server/calendar";
+import { telegramStatus } from "@/lib/server/telegram";
 import { typesafeEnabled } from "@/lib/server/typesafe";
 import { voiceStatus, wakeWordConfig } from "@/lib/server/voice";
 
@@ -19,6 +21,7 @@ export async function GET() {
     stt: features.deepgram() ? "deepgram" : "none",
     wake: wakeWordConfig(),
     typesafe: typesafeEnabled(),
-    gmail: { configured: features.google(), account: gmailAccount() },
+    gmail: { configured: features.google(), account: gmailAccount(), calendar: calendarReady() },
+    telegram: telegramStatus(),
   });
 }

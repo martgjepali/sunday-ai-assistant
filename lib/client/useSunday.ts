@@ -33,6 +33,7 @@ declare global {
       hide(): void;
       getAutoStart(): Promise<boolean>;
       setAutoStart(on: boolean): Promise<boolean>;
+      idleSeconds?(): Promise<number>;
     };
   }
 }
@@ -545,7 +546,8 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     };
     const tick = async () => {
       try {
-        const res = await api("/api/reminders?action=claim", { method: "POST" });
+        const idle = (await window.sundayDesktop?.idleSeconds?.().catch(() => 0)) ?? 0;
+        const res = await api(`/api/reminders?action=claim&idle=${Math.round(idle)}`, { method: "POST" });
         if (!res.ok) return;
         const { due, notices = [] } = (await res.json()) as {
           due: { kind: "reminder" | "timer"; text: string; late: boolean }[];

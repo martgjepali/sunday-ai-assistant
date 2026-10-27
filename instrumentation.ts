@@ -5,4 +5,10 @@ export async function register() {
   // Load the local brain into the GPU now, so the first "Hey Sunday" doesn't wait for it.
   const { warmLocal } = await import("./lib/server/brains");
   warmLocal();
+  // Sir's phone: listen to his Telegram bot (no-op without TELEGRAM_BOT_TOKEN).
+  const { startTelegram } = await import("./lib/server/telegram");
+  startTelegram();
+  // Scheduled routines ("every weekday at 8: my briefing").
+  const { startRoutines } = await import("./lib/server/routines");
+  startRoutines();
 }

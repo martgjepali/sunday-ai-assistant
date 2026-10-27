@@ -67,10 +67,11 @@ const FORCE_LOCAL = /\b(stay local|local brain|offline mode)\b/i;
 /** Work that always deserves the strongest brain. */
 const DEEP_WORK = new RegExp(
   [
-    // coding — real requests, not chat that mentions it ("long night coding"); the local brain hands up anything missed
-    String.raw`\b(vs ?code|debug|refactor|stack ?trace|lint(er|ing)?|typescript|javascript|python|react|next\.?js)\b`,
-    String.raw`\b(my|the|this|that) (code|codebase|project|repo|component|function|script|bug|error|build)\b`,
-    String.raw`\b(write|fix|edit|review|change|explain) (a |an |the |some |my |this |that )?(code|function|component|script|class|bug|test)s?\b`,
+    // coding that needs real reasoning — debugging, refactoring, reviewing. Opening VS Code, creating a
+    // file or a small function stays with the local brain (sir asked for that), which hands up what it can't do.
+    String.raw`\b(debug\w*|refactor\w*|stack ?trace|lint(er|ing)?|code review|review (my|the|this) code)\b`,
+    String.raw`\b(fix|find|track down) (a |an |the |this |that |my )?(bug|error|crash|issue|exception)s?\b`,
+    String.raw`\b(my|the|this|that) (codebase|repo|build (is|fails|failed|broke))\b`,
     // making documents — just finding or opening one ("is the excel file there?") is everyday work
     String.raw`\b(make|create|write|build|draft|generate|prepare|put together|turn)\b[^.?!]{0,60}\b(word doc(ument)?|docx|excel|spreadsheet|xlsx|powerpoint|pptx|presentation|slides?|deck|pdf|cv|resume|cover letter)\b`,
     String.raw`\b(cv|resume|cover letter|presentation|slide deck)\b`,
@@ -86,6 +87,12 @@ const DEEP_WORK = new RegExp(
 const FAST_WORK = new RegExp(
   [
     String.raw`\b(e-?mails?|gmail|inbox|mail|draft|reply to)\b`,
+    // routines: schedules and standing instructions
+    String.raw`\b(routines?|every (day|morning|evening|night|weekday|week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|each (morning|evening|night|week|weekday)|on weekdays)\b`,
+    // planning the day needs judgement across calendar, tasks and reminders
+    String.raw`\b(plan (my|the|out my) (day|week|morning|afternoon)|what should i (do|focus on|work on))\b`,
+    // adding or moving calendar events — date maths the local brain gets wrong; reading stays local
+    String.raw`\b(add|put|book|schedule|reschedule|move|push|plan)\b[^.?!]{0,50}\b(calendar|meeting|appointment|event|call|dinner|lunch|session)\b`,
     String.raw`\b(search the web|look (it )?up|research|news|latest|price|how much is|who (is|won)|what happened)\b`,
     String.raw`\b(screen|look at|what am i looking|this error|clipboard|copied|notepad)\b`,
     String.raw`\b(this|that) (note|window|file|document|page|tab|spreadsheet|sheet|excel|word)\b`,
@@ -105,6 +112,8 @@ export async function chooseBrain(text: string): Promise<{ brain: Brain; why: st
   const wantsLocal = mode === "local" || FORCE_LOCAL.test(text);
   if (!wantsLocal && DEEP_WORK.test(text)) return { brain: "deep", why: "coding, documents or computer use" };
   if (!wantsLocal && FAST_WORK.test(text)) return { brain: "fast", why: "multi-step everyday task" };
+  const lent = gpuLent();
+  if (lent) return { brain: "fast", why: `the GPU is busy with ${lent}` };
   const local = await localBrainStatus();
   if (!local.ready) return { brain: "fast", why: `local brain unavailable (${local.reason})` };
   if (!(await localLoaded())) {
@@ -205,12 +214,25 @@ let warming: Promise<void> | null = null;
  * resets Ollama's timer to its 5-minute default.
  */
 export function warmLocal(): Promise<void> {
+  if (gpuLent()) return Promise.resolve();
   warming ??= localBrainStatus()
     .then((s) => (s.ready ? ollamaApi("/api/generate", { model: LOCAL_MODEL, keep_alive: LOCAL_KEEP_ALIVE }, 120_000) : null))
     .then(() => {})
     .catch(() => {})
     .finally(() => (warming = null));
   return warming;
+}
+
+/**
+ * Lends the GPU to other local work (the local coding model needs all 12 GB): while lent, the
+ * local brain stays unloaded and Haiku answers instead. Pass null to take the GPU back.
+ */
+const gpu = globalThis as unknown as { __sundayGpuLent?: string | null };
+export function lendGpu(to: string | null) {
+  gpu.__sundayGpuLent = to;
+}
+export function gpuLent() {
+  return gpu.__sundayGpuLent ?? null;
 }
 
 /** Frees the ~10 GB of GPU memory the local model holds (games, Blender…). It reloads on next use. */

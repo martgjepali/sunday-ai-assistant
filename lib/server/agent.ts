@@ -19,7 +19,7 @@ import { addMessage, conversationHistory, reflectOnExchange } from "./memory";
 import { requestFromClient } from "./bridge";
 import { LOCAL_PERSONA, PERSONA, dynamicContext } from "./persona";
 import type { ChatSecurity } from "./speaker";
-import { HAND_OFF, runTool, toolHub, toolSchemas } from "./tools";
+import { HAND_OFF, runTool, toolHub, toolSchemas, type Channel } from "./tools";
 
 export type AgentEvent =
   | { type: "meta"; conversationId: string }
@@ -39,7 +39,7 @@ const MAX_TOOL_RESULT = 30_000;
 const LOCAL_HISTORY = 8;
 
 const FAST_NOTE =
-  "You are SUNDAY's quick brain. Coding and editing code, using the mouse and keyboard (computer_task) and expert skills belong to her strongest brain — for those, call hand_off right away, before saying anything.";
+  "You are SUNDAY's quick brain. Everyday coding is yours: open VS Code or a project, create code files (create_text_file), add code (insert_code), make small exact edits (read_code, then edit_file), and start code_task for bigger jobs. Debugging, code reviews, rewriting whole files, using the mouse and keyboard (computer_task) and expert skills belong to her strongest brain — for those, call hand_off right away, before saying anything.";
 
 export async function runAgent(opts: {
   conversationId: string;
@@ -48,8 +48,9 @@ export async function runAgent(opts: {
   security: ChatSecurity;
   signal: AbortSignal;
   emit: (e: AgentEvent) => void;
+  channel?: Channel;
 }) {
-  const { conversationId, userText, mode, security, signal, emit } = opts;
+  const { conversationId, userText, mode, security, signal, emit, channel = "pc" } = opts;
 
   const history = conversationHistory(conversationId);
   addMessage(conversationId, "user", userText);
@@ -60,9 +61,17 @@ export async function runAgent(opts: {
   emit({ type: "activate", ids: ["sunday", "hub:memory", ...ctx.activated] });
 
   let { brain, why } = await chooseBrain(userText);
+  // "Yes, add it anyway" belongs to the brain that asked the question — the local brain may lack the tool.
+  const prev = lastBrain.get(conversationId);
+  if (prev && Date.now() - prev.at < FOLLOW_UP_MS && RANK[prev.brain] > RANK[brain] && userText.length <= 80) {
+    brain = prev.brain;
+    why = "continuing the task it was already handling";
+  }
   let spoken = "";
   /** What really ran this turn — stored with the reply so later turns can trust it. */
   const actions: string[] = [];
+  /** Names of the tools that ran this turn. */
+  const ran: string[] = [];
   let handedFrom: { brain: Brain; reason: string } | null = null;
 
   /** One brain's attempt at this turn. Returns "handoff" when it passes the request up. */
@@ -105,7 +114,7 @@ export async function runAgent(opts: {
           ? { max_tokens: 16000, output_config: { effort: "low" as const } }
           : // Qwen's thinking mode costs seconds per reply; everyday asks don't need it.
             { max_tokens: 1500, thinking: { type: "disabled" as const } };
-    const tools = toolSchemas(brain);
+    const tools = toolSchemas(brain, channel);
     let jsonRetries = 0;
     let nudges = 0;
 
@@ -176,8 +185,10 @@ export async function runAgent(opts: {
       // Follow-through: "One moment, sir" with no tool called means nothing is happening.
       const callsTool = message.content.some((b) => b.type === "tool_use" || b.type === "server_tool_use");
       const nothingRan = actions.length === 0;
+      // Only looked things up — so "I've added it" can't be true.
+      const onlyLooked = ran.every((name) => LOOK_ONLY.has(name));
       if (!callsTool && message.stop_reason !== "pause_turn") {
-        if (local && nothingRan && (PROMISE.test(turnText) || UNSEEN.test(turnText) || CLAIM.test(turnText))) {
+        if (local && ((nothingRan && (PROMISE.test(turnText) || UNSEEN.test(turnText))) || (onlyLooked && CLAIM.test(turnText)))) {
           // Held back, so sir never hears it — the next brain does the work instead.
           recordIssue("local brain", `promised or described something without a tool ("${clip(turnText.trim(), 80)}"); handed up`);
           handedFrom = { brain, reason: "it said it would do this but has no tool for it" };
@@ -252,8 +263,11 @@ export async function runAgent(opts: {
             signal,
             userText,
             lastReply,
+            channel,
+            brain,
           });
           actions.push(describeAction(tu.name, tu.input, outcome.ok, outcome.result));
+          ran.push(tu.name);
           emit({
             type: "tool",
             id: tu.id,
@@ -319,6 +333,7 @@ export async function runAgent(opts: {
 
   const finalText = spoken.trim();
   addMessage(conversationId, "assistant", finalText || "(done)", actions);
+  lastBrain.set(conversationId, { brain, at: Date.now() });
   emit({ type: "done", text: finalText });
 
   reflectOnExchange(conversationId, userText, finalText).catch((err) => {
@@ -345,10 +360,23 @@ function selfNote(brain: Brain, why: string) {
   const mode = brainMode();
   const pinned = mode === "auto" ? "" : ` Sir pinned this brain himself.`;
   return `# Your brain right now (private note — never read it out)
-You're on ${brainSpoken(brain)}.${pinned} If sir asks which brain or model you're using, answer in one natural sentence in your own words, like: "Right now I'm on ${brainSpoken(brain)}." Don't recite model ids, context sizes or why you were picked unless he asks for technical details — brain_status has them.${
+You're on ${brainSpoken(brain)}.${pinned} If sir asks which brain or model you're using, answer in one natural sentence in your own words, like: "Right now I'm on ${brainSpoken(brain)}." Don't recite model ids, context sizes or why you were picked unless he asks for technical details — brain_status has them. Earlier replies may have come from a different brain — each message can use another one, so never "correct" what an earlier reply said about its brain.${
     brain === "local" ? "" : ` (Technical: ${brainFacts(brain)}; picked because ${why}.)`
   }`;
 }
+
+/** Which brain finished each conversation's last turn, so short follow-ups stay with it. */
+const g = globalThis as unknown as { __sundayLastBrain?: Map<string, { brain: Brain; at: number }> };
+const lastBrain = (g.__sundayLastBrain ??= new Map<string, { brain: Brain; at: number }>());
+const FOLLOW_UP_MS = 10 * 60_000;
+const RANK: Record<Brain, number> = { local: 0, fast: 1, deep: 2 };
+
+/** Tools that only look things up — after just these, a brain can't truthfully say it added or changed anything. */
+const LOOK_ONLY = new Set([
+  "recall", "search_files", "list_directory", "file_info", "read_file", "calendar_events", "list_reminders", "tasks_list", "plan_my_day", "routines_list", "code_status", "dev_environment",
+  "get_weather", "system_status", "brain_status", "morning_briefing", "email_search", "email_read", "email_triage",
+  "blender_scene", "look_at_screen", "read_clipboard", "vscode_workspaces", "read_code", "search_in_files", "list_skills",
+]);
 
 /** The system's record of what ran, appended to past replies (see conversationHistory). */
 const ACTIONS_NOTE = /\n*<actions_taken>[\s\S]*?<\/actions_taken>/g;
@@ -359,7 +387,7 @@ const PROMISE =
   /\b(one moment|just a (moment|sec(ond)?)|give me a (moment|sec(ond)?)|hold on|bear with me|on it|right away|let me (check|look|see|find|fix|get|open|try|search|take a look|have a look|pull)|i'?ll (check|look|see|find|fix|get|open|try|search|take a look|have a look|let you know|get back to you|report back|tell you)|i'?m (checking|looking|searching|on it))\b/i;
 /** Saying it already did something ("I've closed the file") — a lie when no tool ran this turn. */
 const CLAIM =
-  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|added|edited|changed|updated|fixed|set|started|stopped|paused|played|turned|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed)\b|^\s*done\b/i;
+  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|added|edited|changed|updated|fixed|set|started|stopped|paused|played|turned|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished|marked|ticked|completed|scheduled|booked|noted|logged|archived|cancell?ed|put|checked off)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed|added|marked|ticked off|scheduled|booked|on (your|the) (list|calendar))\b|^\s*done\b/i;
 /** Talking about his screen or open windows — the local brain can't see either. */
 const UNSEEN =
   /\b(on (your|the) screen|(can|can't|cannot|don't|do not) see (any|it|that|the|your|anything|an?)\b|currently open|you have open|(is|are) open (right now|now)?)/i;

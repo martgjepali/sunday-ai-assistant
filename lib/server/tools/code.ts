@@ -144,6 +144,57 @@ async function assertEditable(p: string) {
 const countOf = (hay: string, needle: string) => (needle ? hay.split(needle).length - 1 : 0);
 const lineOf = (text: string, index: number) => text.slice(0, index).split("\n").length;
 
+/**
+ * Finds the one block of lines in the file that matches the snippet when indentation, trailing
+ * spaces and read_code's "   12  " line-number prefixes are ignored. Returns the file's own text
+ * for that block, or null if there's no match or more than one.
+ */
+function looseMatch(original: string, snippet: string) {
+  const norm = (l: string) => l.replace(/^\s*\d+ {2}/, "").trim();
+  const want = snippet.split(/\r?\n/).map(norm);
+  while (want.length && !want[0]) want.shift();
+  while (want.length && !want[want.length - 1]) want.pop();
+  if (!want.length) return null;
+  const lines = original.split(/\r?\n/);
+  const eol = original.includes("\r\n") ? "\r\n" : "\n";
+  let found: string | null = null;
+  for (let i = 0; i + want.length <= lines.length; i++) {
+    if (want.every((w, j) => lines[i + j].trim() === w)) {
+      if (found !== null) return null; // ambiguous
+      found = lines.slice(i, i + want.length).join(eol);
+    }
+  }
+  return found;
+}
+
+/** Adds new code without matching anything: at the end, the start, or before a line number from read_code. */
+export async function insertCode(input: string, text: string, at: "end" | "start" | number) {
+  const p = resolveUserPath(input);
+  await assertEditable(p);
+  const original = await readText(p);
+  const eol = original.includes("\r\n") ? "\r\n" : "\n";
+  const lines = original.split(/\r?\n/);
+  const block = text.replace(/\r?\n/g, eol).replace(new RegExp(`(${eol})+$`), "").split(eol);
+  let index: number;
+  if (at === "end") {
+    while (lines.length && lines[lines.length - 1] === "") lines.pop();
+    index = lines.length;
+    if (index && lines[index - 1].trim()) block.unshift(""); // a blank line before the new code
+    block.push("");
+  } else if (at === "start") index = 0;
+  else {
+    if (at < 1 || at > lines.length + 1) throw new FileToolError(`The file has ${lines.length} lines — pick a line between 1 and ${lines.length + 1}.`);
+    index = at - 1;
+  }
+  lines.splice(index, 0, ...block);
+  const backup = backupPathFor(p, "edit");
+  await fs.copyFile(p, backup);
+  await fs.writeFile(p, lines.join(eol), "utf8");
+  recordOp("edit", backup, p);
+  logActivity("code", win.basename(p), p);
+  return { path: p, inserted_at_line: index + 1, lines: block.length, note: "Saved. Undo restores the previous version." };
+}
+
 export async function editFile(input: string, oldText: string, newText: string, replaceAll = false) {
   const p = resolveUserPath(input);
   await assertEditable(p);
@@ -156,8 +207,16 @@ export async function editFile(input: string, oldText: string, newText: string, 
     find = find.replace(/\r?\n/g, "\r\n");
     replace = replace.replace(/\r?\n/g, "\r\n");
   }
-  const hits = countOf(original, find);
-  if (hits === 0) throw new FileToolError("That exact text isn't in the file. Re-read it and copy the snippet exactly, including indentation.");
+  let hits = countOf(original, find);
+  if (hits === 0 && !replaceAll) {
+    // Close enough? Same lines but different indentation/trailing spaces, or read_code's line numbers left in.
+    const loose = looseMatch(original, find);
+    if (loose) {
+      find = loose;
+      hits = 1;
+    }
+  }
+  if (hits === 0) throw new FileToolError("That exact text isn't in the file. Re-read it and copy the snippet exactly, including indentation — or use insert_code to add new code.");
   if (hits > 1 && !replaceAll) {
     throw new FileToolError(`That text appears ${hits} times. Include more surrounding lines so it's unique, or set replace_all.`);
   }

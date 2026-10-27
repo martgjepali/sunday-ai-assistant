@@ -3,7 +3,13 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   devIndicators: false,
   // Native speaker-recognition addon: load with Node's require instead of bundling.
-  serverExternalPackages: ["sherpa-onnx-node", "sherpa-onnx-win-x64"],
+  serverExternalPackages: [
+    "sherpa-onnx-node",
+    "sherpa-onnx-win-x64",
+    // Claude Code's agent runs as a bundled native binary — keep it out of the bundle.
+    "@anthropic-ai/claude-agent-sdk",
+    "@anthropic-ai/claude-agent-sdk-win32-x64",
+  ],
   experimental: {
     agentFeedback: true,
   },

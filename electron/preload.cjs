@@ -29,4 +29,5 @@ contextBridge.exposeInMainWorld("sundayDesktop", {
   toggleFullscreen: () => ipcRenderer.send("win:fullscreen"),
   getAutoStart: () => ipcRenderer.invoke("autostart:get"),
   setAutoStart: (on) => ipcRenderer.invoke("autostart:set", Boolean(on)),
+  idleSeconds: () => ipcRenderer.invoke("idle:get"),
 });

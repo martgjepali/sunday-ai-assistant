@@ -10,6 +10,7 @@ import {
   CloseIcon,
   ExpandIcon,
   HistoryIcon,
+  ListIcon,
   MicIcon,
   MinusIcon,
   MuteIcon,
@@ -19,6 +20,7 @@ import {
   SpeakerIcon,
 } from "./Icons";
 import { Orb } from "./Orb";
+import { CodingPanel } from "./CodingPanel";
 
 const GROUP_ORDER = ["core", "hub", "skill", "category", "memory", "conversation", "drive", "folder", "app", "mail", "web", "code"];
 
@@ -42,7 +44,8 @@ export function SundayOS() {
   const [showLabels, setShowLabels] = useState(true);
   const [ambient, setAmbient] = useState(true);
   const [autoOrbit, setAutoOrbit] = useState(true);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  /** The side drawer: this conversation, past conversations, or sir's lists. */
+  const [drawer, setDrawer] = useState<DrawerTab | null>(null);
   const [booted, setBooted] = useState(false);
   const [enrollOpen, setEnrollOpen] = useState(false);
   // The WebGL brain is heavy to set up; it starts at the boot's logo reveal so it
@@ -196,6 +199,8 @@ export function SundayOS() {
         />
       </aside>
 
+      <CodingPanel />
+
       <Dock
         reply={lastReply}
         interim={sunday.interim}
@@ -207,13 +212,16 @@ export function SundayOS() {
         onMic={sunday.toggleSession}
         voiceReplies={sunday.voiceReplies}
         setVoiceReplies={sunday.setVoiceReplies}
-        onHistory={() => setHistoryOpen((o) => !o)}
+        onHistory={() => setDrawer((d) => (d === "now" || d === "past" ? null : "now"))}
+        onLists={() => setDrawer((d) => (d === "lists" ? null : "lists"))}
+        listsOpen={drawer === "lists"}
         hasStt={sunday.status?.stt === "deepgram"}
       />
 
       <HistoryDrawer
-        open={historyOpen}
-        onClose={() => setHistoryOpen(false)}
+        tab={drawer}
+        onTab={setDrawer}
+        onClose={() => setDrawer(null)}
         entries={sunday.entries}
         conversationId={sunday.conversationId}
         onLoad={(id) => void sunday.loadConversation(id)}
@@ -490,8 +498,34 @@ function SystemsPanel({
   useEffect(() => {
     if (isDesktop) void window.sundayDesktop?.getAutoStart().then(setAutoStart);
   }, [isDesktop]);
+  // Telegram pairing: a one-time code he sends to his bot.
+  const [pairing, setPairing] = useState<{ code: string; bot: string | null } | null>(null);
+  const pairPhone = () => {
+    void api("/api/telegram", { method: "POST", body: JSON.stringify({ action: "pair" }) })
+      .then((r) => r.json())
+      .then((r: { code?: string; bot?: string | null }) => r.code && setPairing({ code: r.code, bot: r.bot ?? null }))
+      .catch(() => {});
+  };
 
   if (!status) return <section className="panel systems" aria-busy />;
+  const phone = status.telegram;
+  const phoneRow = {
+    name: "Phone",
+    ok: phone.paired ? (phone.error ? ("partial" as const) : true) : phone.configured ? ("partial" as const) : false,
+    value: phone.paired
+      ? `Telegram · ${phone.paired}${phone.error ? ` · ${phone.error}` : ""}`
+      : pairing
+        ? `/pair ${pairing.code}` // short so it never gets cut off; he sends exactly this to his bot
+        : phone.configured
+          ? phone.error ?? "not paired"
+          : "TELEGRAM_BOT_TOKEN missing",
+    action:
+      phone.configured && !phone.paired ? (
+        <button className="link-btn" onClick={pairPhone}>
+          {pairing ? "New code" : "Pair"}
+        </button>
+      ) : undefined,
+  };
   const rows: { name: string; ok: boolean | "partial"; value: string; action?: ReactNode }[] = [
     { name: "Core", ok: status.brain, value: status.brain ? `${status.model} · ${status.effort}` : "ANTHROPIC_API_KEY missing" },
     {
@@ -528,16 +562,21 @@ function SystemsPanel({
       value: status.typesafe ? "Jev judgments live" : "TYPESAFE_API_KEY missing",
     },
     {
-      name: "Gmail",
-      ok: Boolean(status.gmail.account),
-      value: status.gmail.account ?? (status.gmail.configured ? "not connected" : "GOOGLE_CLIENT_ID missing"),
+      name: "Google",
+      ok: status.gmail.account ? (status.gmail.calendar ? true : "partial") : false,
+      value: status.gmail.account
+        ? `${status.gmail.calendar ? "Gmail + Calendar" : "Gmail only"} · ${status.gmail.account}`
+        : status.gmail.configured
+          ? "not connected"
+          : "GOOGLE_CLIENT_ID missing",
       action:
-        status.gmail.configured && !status.gmail.account ? (
+        status.gmail.configured && !(status.gmail.account && status.gmail.calendar) ? (
           <a className="link-btn" href="/api/google/auth" target="_blank" rel="noreferrer">
-            Connect
+            {status.gmail.account ? "Reconnect" : "Connect"}
           </a>
         ) : undefined,
     },
+    phoneRow,
   ];
   return (
     <section className="panel systems">
@@ -608,6 +647,24 @@ const TOOL_NAMES: Record<string, string> = {
   create_text_file: "writing note",
   generate_image: "generating image",
   save_image: "saving image",
+  calendar_events: "checking calendar",
+  task_add: "adding to list",
+  tasks_list: "checking lists",
+  task_done: "ticking off",
+  task_change: "updating list",
+  plan_my_day: "planning your day",
+  code_task: "starting coding task",
+  insert_code: "adding code",
+  code_status: "checking the code task",
+  code_stop: "stopping the code task",
+  code_approve: "passing on your answer",
+  dev_environment: "checking dev tools",
+  routine_add: "setting up routine",
+  routines_list: "checking routines",
+  routine_change: "updating routine",
+  routine_run_now: "running routine",
+  calendar_add: "adding to calendar",
+  calendar_change: "updating calendar",
   blender_open: "opening Blender",
   blender_scene: "reading the scene",
   blender_run_python: "building in Blender",
@@ -671,6 +728,8 @@ function Dock(p: {
   voiceReplies: boolean;
   setVoiceReplies: (v: boolean) => void;
   onHistory: () => void;
+  onLists: () => void;
+  listsOpen: boolean;
   hasStt: boolean;
 }) {
   const [text, setText] = useState("");
@@ -759,6 +818,9 @@ function Dock(p: {
         >
           {p.voiceReplies ? <SpeakerIcon /> : <MuteIcon />}
         </button>
+        <button type="button" className="icon-btn" onClick={p.onLists} aria-label="Lists" aria-pressed={p.listsOpen} data-active={p.listsOpen || undefined}>
+          <ListIcon />
+        </button>
         <button type="button" className="icon-btn" onClick={p.onHistory} aria-label="Conversation history">
           <HistoryIcon />
         </button>
@@ -772,29 +834,34 @@ function Dock(p: {
 
 /* ───────────────────────── History ───────────────────────── */
 
+type DrawerTab = "now" | "past" | "lists";
+
 function HistoryDrawer(p: {
-  open: boolean;
+  tab: DrawerTab | null;
+  onTab: (tab: DrawerTab) => void;
   onClose: () => void;
   entries: ChatEntry[];
   conversationId: string | null;
   onLoad: (id: string | null) => void;
 }) {
-  const [tab, setTab] = useState<"now" | "past">("now");
+  const open = p.tab !== null;
+  const tab = p.tab ?? "now";
+  const setTab = p.onTab;
   const [past, setPast] = useState<{ id: string; title: string | null; updated_at: number; message_count: number }[]>([]);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (p.open && tab === "past") {
+    if (open && tab === "past") {
       void getJSON<{ conversations: typeof past }>("/api/conversations").then((r) => setPast(r.conversations));
     }
-  }, [p.open, tab]);
+  }, [open, tab]);
 
   useEffect(() => {
-    if (p.open && tab === "now") endRef.current?.scrollIntoView({ block: "end" });
-  }, [p.open, tab, p.entries]);
+    if (open && tab === "now") endRef.current?.scrollIntoView({ block: "end" });
+  }, [open, tab, p.entries]);
 
   return (
-    <aside className="drawer panel" data-open={p.open || undefined} aria-hidden={!p.open}>
+    <aside className="drawer panel" data-open={open || undefined} aria-hidden={!open}>
       <header className="drawer-head">
         <div className="tabs" role="tablist">
           <button role="tab" aria-selected={tab === "now"} onClick={() => setTab("now")}>
@@ -802,6 +869,9 @@ function HistoryDrawer(p: {
           </button>
           <button role="tab" aria-selected={tab === "past"} onClick={() => setTab("past")}>
             Past
+          </button>
+          <button role="tab" aria-selected={tab === "lists"} onClick={() => setTab("lists")}>
+            Lists
           </button>
         </div>
         <button className="icon-btn ghost" onClick={() => p.onLoad(null)} aria-label="New conversation" title="New conversation">
@@ -811,7 +881,9 @@ function HistoryDrawer(p: {
           <CloseIcon width={16} height={16} />
         </button>
       </header>
-      {tab === "now" ? (
+      {tab === "lists" ? (
+        <ListsPanel visible={open} />
+      ) : tab === "now" ? (
         <div className="log">
           {p.entries.length === 0 && <p className="hint">Nothing said yet. Say “Hey Sunday” or type below.</p>}
           {p.entries.map((e) => (
@@ -846,6 +918,88 @@ function HistoryDrawer(p: {
         </ul>
       )}
     </aside>
+  );
+}
+
+/* ───────────────────────── Lists ───────────────────────── */
+
+type Task = { id: number; list: string; text: string; when?: string; priority?: "high" | "low"; done?: boolean };
+
+/** Sir's lists, live: SUNDAY adds to them by voice, he can tick, add and put away here. */
+function ListsPanel({ visible }: { visible: boolean }) {
+  const [lists, setLists] = useState<Record<string, Task[]> | null>(null);
+  const [text, setText] = useState("");
+  const [target, setTarget] = useState("To-do");
+
+  const load = useCallback(() => {
+    void getJSON<{ lists: Record<string, Task[]> }>("/api/tasks").then((r) => setLists(r.lists)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!visible) return;
+    load();
+    const timer = setInterval(load, 4000);
+    return () => clearInterval(timer);
+  }, [visible, load]);
+
+  const act = (body: object) =>
+    void api("/api/tasks", { method: "POST", body: JSON.stringify(body) })
+      .then((r) => r.json())
+      .then((r: { lists?: Record<string, Task[]> }) => r.lists && setLists(r.lists))
+      .catch(() => {});
+
+  const names = Array.from(new Set(["To-do", ...Object.keys(lists ?? {})]));
+  return (
+    <div className="lists">
+      <form
+        className="list-add"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!text.trim()) return;
+          act({ action: "add", list: target, text });
+          setText("");
+        }}
+      >
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder={`Add to ${target}…`} aria-label="New item" />
+        <select value={target} onChange={(e) => setTarget(e.target.value)} aria-label="List">
+          {names.map((n) => (
+            <option key={n}>{n}</option>
+          ))}
+        </select>
+      </form>
+      {lists && Object.keys(lists).length === 0 && <p className="hint">No lists yet. Try “Hey Sunday, add milk and eggs to my shopping list.”</p>}
+      {Object.entries(lists ?? {}).map(([name, items]) => (
+        <section key={name} className="list">
+          <h3 className="eyebrow">
+            {name} <span className="count">{items.filter((t) => !t.done).length}</span>
+          </h3>
+          <ul>
+            {items.map((t) => (
+              <li key={t.id} data-done={t.done || undefined}>
+                <button
+                  className="tick"
+                  role="checkbox"
+                  aria-checked={Boolean(t.done)}
+                  aria-label={t.done ? `Untick ${t.text}` : `Tick off ${t.text}`}
+                  onClick={() => act({ action: t.done ? "undo" : "done", id: t.id })}
+                />
+                <span className="task-text">
+                  {t.priority === "high" && <span className="task-flag">!</span>}
+                  {t.text}
+                  {t.when && !t.done && (
+                    <span className="task-when" data-late={t.when.startsWith("overdue") || undefined}>
+                      {t.when}
+                    </span>
+                  )}
+                </span>
+                <button className="icon-btn ghost task-away" onClick={() => act({ action: "archive", id: t.id })} aria-label={`Put away ${t.text}`} title="Put away (not deleted)">
+                  <CloseIcon width={12} height={12} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </div>
   );
 }
 

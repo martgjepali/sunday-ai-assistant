@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { calendarReady } from "@/lib/server/calendar";
 import { completeGoogleAuth } from "@/lib/server/tools/gmail";
 
 const page = (title: string, body: string) =>
@@ -14,11 +15,14 @@ const escape = (s: string) => s.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};
 export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get("code");
   const state = req.nextUrl.searchParams.get("state") ?? "";
-  if (!code) return page("Gmail not connected", "Google didn't return an authorisation code.");
+  if (!code) return page("Google not connected", "Google didn't return an authorisation code.");
   try {
     const email = await completeGoogleAuth(code, state);
-    return page("Gmail connected", `SUNDAY can now read ${escape(email)} and write drafts. You can close this tab.`);
+    const calendar = calendarReady()
+      ? " She can also see your calendar and add or move your own events — never deleting them or inviting anyone."
+      : " Calendar access wasn't granted — tick the Calendar box next time if you'd like it.";
+    return page("Google connected", `SUNDAY can now read ${escape(email)} and write drafts.${calendar} You can close this tab.`);
   } catch (err) {
-    return page("Gmail not connected", escape(err instanceof Error ? err.message : String(err)));
+    return page("Google not connected", escape(err instanceof Error ? err.message : String(err)));
   }
 }

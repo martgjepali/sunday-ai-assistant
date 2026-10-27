@@ -23,7 +23,7 @@ import {
   undoFileOperations,
   uniqueTarget,
 } from "./files";
-import { editFile, openInVSCode, readCode, searchInFiles, vscodeWorkspaces, writeFile } from "./code";
+import { editFile, insertCode, openInVSCode, readCode, searchInFiles, vscodeWorkspaces, writeFile } from "./code";
 import {
   closeApplication,
   lockPc,
@@ -42,6 +42,9 @@ import { brainDiagnostics, repairBrain } from "../diagnostics";
 import { computerTask } from "../computer";
 import { createDocument } from "../documents";
 import { ASPECT_RATIOS, generateImage, saveImages, sirNamedPlace } from "../images";
+import { addEvent, calendarReady, changeEvent, listEvents, todaysEvents } from "../calendar";
+import { addTasks, changeTask, completeTasks, listTasks, tasksForToday } from "../tasks";
+import { answerApproval, codingState, devEnvironment, recordQuickCode, startCoding, stopCoding } from "../coder";
 import { blenderImport, blenderLook, blenderRun, blenderSave, blenderScene, openBlender } from "../blender";
 import { cancelReminder, createReminder, listReminders, markBriefed, todaysReminders, weather } from "../reminders";
 
@@ -54,6 +57,10 @@ export type ToolContext = {
   /** Sir's own words this turn, and SUNDAY's reply before them — for tools that may act only on what he said. */
   userText?: string;
   lastReply?: string;
+  /** Where the request came from — "telegram" means sir's phone. */
+  channel?: Channel;
+  /** Which brain is calling (the local brain's coding jobs default to the free local engine). */
+  brain?: Brain;
 };
 export type ToolImage = { data: string; mediaType: "image/jpeg" | "image/png" };
 export type ToolOutcome = { result: unknown; activate: string[]; image?: ToolImage };
@@ -163,7 +170,7 @@ const TOOLS = [
     name: "create_text_file",
     hub: "files",
     description:
-      "Create a new plain-text file — a note, list or memo (.txt by default; .md, .csv, .json and .log also work). Its folder is created if missing. Never overwrites: a taken name gets ' (2)'. Undo removes it.",
+      "Create a new text or code file with its content — a note (.txt by default, .md), or source code (.py, .js, .ts, .html, .css, .java, .cs, .json…). Its folder is created if missing. Never overwrites: a taken name gets ' (2)'. Undo removes it. After creating code, open_in_vscode shows it to sir.",
     schema: z.object({ path: z.string(), content: z.string().default("") }),
     run: async ({ path: p, content }) => {
       let target = resolveUserPath(p);
@@ -363,10 +370,10 @@ const TOOLS = [
     name: "morning_briefing",
     hub: "time",
     description:
-      "Gather sir's morning briefing: date, weather, today's reminders, and the important unread emails. Use when he says good morning or asks for his briefing/rundown of the day, then deliver it conversationally — weather in a line, then what's on today, then anything urgent in the inbox.",
+      "Gather sir's morning briefing: date, weather, today's calendar and reminders, and the important unread emails. Use when he says good morning or asks for his briefing/rundown of the day, then deliver it conversationally — weather in a line, then what's on today, then anything urgent in the inbox.",
     schema: z.object({ city: z.string().optional().describe("Only if he names a city or none is remembered yet") }),
     run: async ({ city }) => {
-      const [w, mail] = await Promise.all([
+      const [w, mail, calendar] = await Promise.all([
         weather(city).catch((e) => ({ error: String(e) })),
         gmailAccount()
           ? triageEmail("is:unread newer_than:2d", 20)
@@ -376,12 +383,15 @@ const TOOLS = [
               }))
               .catch((e) => ({ error: String(e) }))
           : Promise.resolve({ note: "Gmail not connected" }),
+        calendarReady() ? todaysEvents().catch((e) => ({ error: String(e) })) : Promise.resolve({ note: "Calendar not connected" }),
       ]);
       markBriefed();
       return {
         result: {
           date: new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }),
           weather: w,
+          calendar_today: calendar,
+          tasks_today: tasksForToday(),
           reminders_today: todaysReminders(),
           email: mail,
         },
@@ -406,6 +416,254 @@ const TOOLS = [
       result: await createDocument({ format, request, filename, folder, sources, openWhenReady: open_when_ready }),
       activate: ["hub:docs"],
     }),
+  }),
+  def({
+    name: "code_task",
+    hub: "code",
+    description:
+      "Hand real coding work to SUNDAY's coding engine (the Claude Code agent): build a feature, fix a bug, refactor, write tests, or create a new project from scratch — it reads the project, plans, edits, runs builds/tests and verifies, in the background while the coding panel shows progress. Give it a complete brief in goal (what sir wants, constraints, stack, anything from the conversation). For an existing project pass project (find it with vscode_workspaces or search_files if he named it loosely); for a new one pass new_project_name (+ new_project_in, default D:\\Projects). Opens the project in VS Code so he can watch (or Visual Studio for .NET if he prefers). continue_previous carries on the last task in the same project (follow-ups, answers to its questions). plan_only makes a plan without changing anything.",
+    schema: z.object({
+      goal: z.string().min(10),
+      project: z.string().optional(),
+      new_project_name: z.string().optional(),
+      new_project_in: z.string().optional(),
+      editor: z.enum(["vscode", "visual_studio", "none"]).optional(),
+      model: z
+        .enum(["best", "quick", "local"])
+        .optional()
+        .describe("best = Opus (default, most capable, costs most); quick = Sonnet (about half the price, fine for simple tasks); local = free coder on his GPU — only for small single-file jobs, scripts and explanations, or when he asks for local/free"),
+      plan_only: z.boolean().optional(),
+      continue_previous: z.boolean().optional(),
+    }),
+    run: async (i, ctx) => ({
+      result: await startCoding({
+        goal: i.goal,
+        project: i.project,
+        newProjectName: i.new_project_name,
+        newProjectIn: i.new_project_in,
+        editor: i.editor,
+        model: i.model ?? (ctx.brain === "local" ? "local" : undefined),
+        planOnly: i.plan_only,
+        continuePrevious: i.continue_previous,
+      }),
+      activate: ["hub:code"],
+    }),
+  }),
+  def({
+    name: "code_status",
+    hub: "code",
+    description: "How the coding task is going: status, what it's doing now, its todo list, files changed, cost, its final summary, or a command waiting for sir's OK.",
+    schema: z.object({}),
+    run: async () => ({ result: codingState(), activate: ["hub:code"] }),
+  }),
+  def({
+    name: "code_stop",
+    hub: "code",
+    description: "Stop the running coding task (changes made so far stay; undo can roll back files).",
+    schema: z.object({}),
+    run: async () => ({ result: stopCoding(), activate: ["hub:code"] }),
+  }),
+  def({
+    name: "code_approve",
+    hub: "code",
+    description: "Pass on sir's answer to the command the coding task is waiting on — only after he has said yes or no to it in this message.",
+    schema: z.object({ allow: z.boolean() }),
+    run: async ({ allow }, ctx) => {
+      // His decision, not the model's: the words must be in what he just said.
+      const said = ctx.userText ?? "";
+      const yes = /\b(yes|yeah|yep|allow|approve|approved|go ahead|do it|ok(ay)?|sure|fine|run it)\b/i.test(said);
+      const no = /\b(no|nope|deny|don'?t|stop|cancel|block)\b/i.test(said);
+      if (allow ? !yes || no : !no) throw new FileToolError("Ask sir first — only his own yes or no can answer the coding task.");
+      return { result: answerApproval(allow), activate: ["hub:code"] };
+    },
+  }),
+  def({
+    name: "dev_environment",
+    hub: "code",
+    description: "Check sir's PC for coding: Node, npm, Git, Python, .NET, Java, VS Code, Visual Studio — and, given a project folder, what kind of project it is and its git status. Use before starting a new project or when he asks what he can build with.",
+    schema: z.object({ project: z.string().optional() }),
+    run: async ({ project }) => ({ result: await devEnvironment(project), activate: ["hub:code"] }),
+  }),
+  def({
+    name: "task_add",
+    hub: "lists",
+    description:
+      "Put items on one of sir's lists: his to-do list (default), the shopping list, or any list he names ('packing', 'ideas'…). Several items at once: 'eggs, milk and bread' is three items. Due dates in his local time (2026-10-28 or 2026-10-28T15:00), only if he gave one.",
+    schema: z.object({
+      list: z.string().optional().describe("Default: To-do"),
+      items: z
+        .array(
+          z.object({
+            text: z.string().min(1),
+            due: z.string().optional(),
+            priority: z.enum(["high", "normal", "low"]).optional(),
+            notes: z.string().optional(),
+          }),
+        )
+        .min(1)
+        .max(30),
+    }),
+    run: async ({ list, items }) => ({ result: addTasks({ list, items }), activate: ["hub:lists"] }),
+  }),
+  def({
+    name: "tasks_list",
+    hub: "lists",
+    description: "Read sir's lists — everything open, or one list. Overdue and due-today items are marked.",
+    schema: z.object({
+      list: z.string().optional(),
+      include_done: z.boolean().optional().describe("Also show items ticked off in the last week"),
+    }),
+    run: async ({ list, include_done }) => ({ result: listTasks({ list, includeDone: include_done }), activate: ["hub:lists"] }),
+  }),
+  def({
+    name: "task_done",
+    hub: "lists",
+    description: "Tick items off (by id from tasks_list, or by a few words of the item, e.g. 'milk'). undo puts them back.",
+    schema: z.object({
+      items: z.array(z.union([z.number().int(), z.string().min(1)])).min(1),
+      list: z.string().optional(),
+      undo: z.boolean().optional(),
+    }),
+    run: async ({ items, list, undo }) => ({ result: completeTasks({ refs: items, list, undo }), activate: ["hub:lists"] }),
+  }),
+  def({
+    name: "task_change",
+    hub: "lists",
+    description:
+      "Change one item (by id or words): rename, set or clear the due date (null), priority, notes, or move it to another list. archive puts it away without ticking it off (nothing is ever deleted); restore brings it back.",
+    schema: z.object({
+      item: z.union([z.number().int(), z.string().min(1)]),
+      text: z.string().optional(),
+      due: z.string().nullable().optional(),
+      priority: z.enum(["high", "normal", "low"]).optional(),
+      list: z.string().optional(),
+      notes: z.string().optional(),
+      archive: z.boolean().optional(),
+      restore: z.boolean().optional(),
+    }),
+    run: async ({ item, ...rest }) => ({ result: changeTask({ ref: item, ...rest }), activate: ["hub:lists"] }),
+  }),
+  def({
+    name: "plan_my_day",
+    hub: "lists",
+    description:
+      "Gather everything for planning sir's day: the time now, today's calendar, tasks due or overdue and high-priority ones, and today's reminders. Then propose a realistic plan in time order around his fixed events — what to do when, what can wait — in a few spoken sentences. Offer to block focus time in his calendar, but only add it if he says yes.",
+    schema: z.object({}),
+    run: async () => ({
+      result: {
+        now: new Date().toLocaleString("en-GB", { weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" }),
+        calendar: calendarReady() ? await todaysEvents().catch((e) => ({ error: String(e) })) : { note: "Calendar not connected" },
+        tasks: tasksForToday(),
+        open_lists: listTasks().open,
+        reminders_today: todaysReminders(),
+      },
+      activate: ["hub:lists", "hub:calendar", "hub:time"],
+    }),
+  }),
+  def({
+    name: "routine_add",
+    hub: "routines",
+    description:
+      "Set up something SUNDAY does on her own on a schedule, e.g. 'every weekday at 8: my briefing', 'Sundays at 19:00: review my week and plan the next', 'every night at 23:00: remind me to wind down'. prompt is the instruction she'll follow each time, written as if sir asked it. The result is spoken at the PC, or sent to his phone when he's away. Routines can't take over the PC.",
+    schema: z.object({
+      name: z.string().min(1).describe("Short name, e.g. 'Morning briefing'"),
+      prompt: z.string().min(3),
+      time: z.string().describe("24-hour local time, e.g. 08:00"),
+      days: z.union([z.string(), z.array(z.string())]).describe("'daily', 'weekdays', 'weekends', or days like ['mon','thu']"),
+    }),
+    run: async (i) => ({ result: (await import("../routines")).addRoutine(i), activate: ["hub:routines"] }),
+  }),
+  def({
+    name: "routines_list",
+    hub: "routines",
+    description: "List sir's routines: what each does, when, whether it's on, when it runs next and what it said last time.",
+    schema: z.object({}),
+    run: async () => ({ result: (await import("../routines")).listRoutines(), activate: ["hub:routines"] }),
+  }),
+  def({
+    name: "routine_change",
+    hub: "routines",
+    description: "Change a routine (by id or name): reschedule, reword, pause (on: false) or resume (on: true), or put it away (archive — never deleted).",
+    schema: z.object({
+      routine: z.union([z.number().int(), z.string().min(1)]),
+      name: z.string().optional(),
+      prompt: z.string().optional(),
+      time: z.string().optional(),
+      days: z.union([z.string(), z.array(z.string())]).optional(),
+      on: z.boolean().optional(),
+      archive: z.boolean().optional(),
+    }),
+    run: async ({ routine, ...rest }) => ({ result: (await import("../routines")).changeRoutine({ ref: routine, ...rest }), activate: ["hub:routines"] }),
+  }),
+  def({
+    name: "routine_run_now",
+    hub: "routines",
+    description: "Run one of sir's routines right now (when he wants to try it). Its result is announced like a scheduled run.",
+    schema: z.object({ routine: z.union([z.number().int(), z.string().min(1)]) }),
+    run: async ({ routine }, ctx) => {
+      if (ctx.channel === "routine") throw new FileToolError("A routine can't start another routine.");
+      const { runRoutineNow } = await import("../routines");
+      void runRoutineNow(routine).catch(() => {});
+      return { result: { started: true, note: "Running in the background — its result will be announced when it's done. Tell sir it's underway." }, activate: ["hub:routines"] };
+    },
+  }),
+  def({
+    name: "calendar_events",
+    hub: "calendar",
+    description:
+      "Look at sir's Google Calendar: what's on, when he's free, when something is. Times are his local time, written like 2026-10-28T15:00 (or a plain date for whole days). Defaults to the next 7 days. For 'am I free…' read the events in that window and say plainly.",
+    schema: z.object({
+      from: z.string().optional(),
+      to: z.string().optional().describe("A plain date includes that whole day"),
+      query: z.string().optional().describe("Words to search for, e.g. 'dentist'"),
+    }),
+    run: async ({ from, to, query }) => ({ result: await listEvents({ from, to, query }), activate: ["hub:calendar"] }),
+  }),
+  def({
+    name: "calendar_add",
+    hub: "calendar",
+    description:
+      "Add an event to sir's Google Calendar (his local time, e.g. start 2026-10-30T15:00). It checks for clashes first and adds nothing if there is one — then ask him. Never invites anyone. Default length 60 minutes.",
+    schema: z.object({
+      title: z.string().min(1),
+      start: z.string(),
+      end: z.string().optional(),
+      minutes: z.number().int().min(5).max(1440).optional().describe("Length, if no end"),
+      all_day: z.boolean().optional(),
+      location: z.string().optional(),
+      notes: z.string().optional(),
+      reminder_minutes: z.number().int().min(0).max(10080).optional().describe("Phone/Google reminder this many minutes before"),
+      despite_clash: z.boolean().optional().describe("Only after he said yes to a clash"),
+    }),
+    run: async (i) => ({
+      result: await addEvent({
+        title: i.title,
+        start: i.start,
+        end: i.end,
+        minutes: i.minutes,
+        allDay: i.all_day,
+        location: i.location,
+        notes: i.notes,
+        reminderMinutes: i.reminder_minutes,
+        despiteClash: i.despite_clash,
+      }),
+      activate: ["hub:calendar"],
+    }),
+  }),
+  def({
+    name: "calendar_change",
+    hub: "calendar",
+    description:
+      "Reschedule, rename or update one of sir's own calendar events (id from calendar_events). Moving the start keeps the length unless end is given. Events with other people can't be changed — he does those himself. There is no delete.",
+    schema: z.object({
+      id: z.string(),
+      title: z.string().optional(),
+      start: z.string().optional(),
+      end: z.string().optional(),
+      location: z.string().optional(),
+      notes: z.string().optional(),
+    }),
+    run: async (i) => ({ result: await changeEvent(i), activate: ["hub:calendar"] }),
   }),
   def({
     name: "generate_image",
@@ -593,6 +851,21 @@ const TOOLS = [
     run: async ({ folder, query, extension, max_results }) => searchInFiles(folder, query, extension, max_results),
   }),
   def({
+    name: "insert_code",
+    hub: "code",
+    description:
+      "Add new code to a file without matching existing text — the easy way to add a function, import or block. at: \"end\", \"start\", or a line number from read_code (the new code goes before that line). Backed up; undo restores it.",
+    schema: z.object({
+      path: z.string(),
+      code: z.string().min(1),
+      at: z.union([z.enum(["end", "start"]), z.number().int().min(1)]).default("end"),
+    }),
+    run: async ({ path: p, code, at }) => {
+      const r = await insertCode(p, code, at);
+      return { result: r, activate: [`code:${r.path.toLowerCase()}`] };
+    },
+  }),
+  def({
     name: "edit_file",
     hub: "code",
     description:
@@ -727,24 +1000,49 @@ export function toolHub(name: string) {
 }
 
 /** The everyday tools the local brain gets — small models get confused by ~50. */
-const TEXT_FILE_TYPES = new Set([".txt", ".md", ".csv", ".json", ".log"]);
+/** Where a request came from: his PC, his phone (Telegram), or one of his scheduled routines. */
+export type Channel = "pc" | "telegram" | "routine";
+
+/** Tools that act on the PC itself — never from his phone (in case his Telegram is ever compromised) or unattended in a routine. */
+const REMOTE_BLOCKED = new Set([
+  "computer_task", "power", "close_application", "lock_pc", "show_desktop",
+  "move_items", "rename_item", "undo_file_operations", "edit_file", "write_file",
+  "blender_open", "blender_run_python", "blender_import", "blender_save",
+  "look_at_screen", "read_clipboard", "write_clipboard", "open_in_vscode",
+  "code_task", "code_approve",
+]);
+
+/** Direct code tools whose work shows up in the coding panel. */
+const QUICK_CODE = new Set(["create_text_file", "insert_code", "edit_file", "write_file", "read_code", "search_in_files", "open_in_vscode"]);
+
+/** Plain-text and source files create_text_file may make (new files only — it never overwrites). */
+const TEXT_FILE_TYPES = new Set([
+  ".txt", ".md", ".csv", ".json", ".log",
+  ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss", ".java", ".cs", ".cpp", ".c", ".h",
+  ".go", ".rs", ".php", ".rb", ".sql", ".sh", ".ps1", ".bat", ".yml", ".yaml", ".toml", ".xml", ".ini",
+]);
 
 const LOCAL_TOOLS = new Set([
   "remember", "recall", "search_files", "list_directory", "create_folder", "create_text_file",
   "open_application", "open_path", "open_url", "browser_search", "close_application", "save_image",
   "media_control", "volume", "system_status", "lock_pc", "show_desktop",
-  "set_reminder", "set_timer", "list_reminders", "cancel_reminder", "get_weather", "morning_briefing",
+  "set_reminder", "set_timer", "list_reminders", "cancel_reminder", "get_weather", "morning_briefing", "calendar_events",
+  "task_add", "tasks_list", "task_done", "task_change",
+  // light coding: open and read projects, create files, small exact edits, and hand bigger jobs to the (free, local) coding engine
+  "vscode_workspaces", "open_in_vscode", "read_code", "search_in_files", "insert_code", "edit_file", "dev_environment", "code_task", "code_status", "code_stop",
   "brain_status", "set_brain_mode", "repair_brain",
 ]);
 /** Only the deep brain drives the computer or edits code. */
-const DEEP_ONLY = new Set(["computer_task", "edit_file", "write_file", "use_skill", "blender_run_python", "blender_look", "blender_import"]);
+const DEEP_ONLY = new Set(["computer_task", "write_file", "use_skill", "blender_run_python", "blender_look", "blender_import"]);
 
 /** Not a real tool: the local and fast brains call it to pass a request up. */
 export const HAND_OFF = "hand_off";
 
-export function toolSchemas(brain: Brain = "deep"): Anthropic.Beta.BetaToolUnion[] {
-  const offered = TOOLS.filter((t) =>
-    brain === "deep" ? true : brain === "local" ? LOCAL_TOOLS.has(t.name) : !DEEP_ONLY.has(t.name),
+export function toolSchemas(brain: Brain = "deep", channel: Channel = "pc"): Anthropic.Beta.BetaToolUnion[] {
+  const offered = TOOLS.filter(
+    (t) =>
+      (brain === "deep" ? true : brain === "local" ? LOCAL_TOOLS.has(t.name) : !DEEP_ONLY.has(t.name)) &&
+      !(channel !== "pc" && REMOTE_BLOCKED.has(t.name)),
   );
   const custom = offered.map((t) => {
     const { $schema: _ignored, ...schema } = z.toJSONSchema(t.schema) as Record<string, unknown>;
@@ -768,7 +1066,7 @@ export function toolSchemas(brain: Brain = "deep"): Anthropic.Beta.BetaToolUnion
     name: HAND_OFF,
     description:
       brain === "local"
-        ? "Pass this request to SUNDAY's stronger brain. Call it right away — before saying anything — when the request needs a tool you don't have (web search, email, the screen, moving or renaming files, documents, coding, using the computer), takes several careful steps, or you're unsure you'd get it right."
+        ? "Pass this request to SUNDAY's stronger brain. Call it right away — before saying anything — when the request needs a tool you don't have (web search, email, the screen, moving or renaming files, documents, debugging or reviewing code, using the computer), takes several careful steps, or you're unsure you'd get it right."
         : "Pass this request to SUNDAY's strongest brain. Call it right away — before saying anything — for coding or editing code, using the computer (mouse and keyboard), loading expert skills, or anything that needs deep reasoning you're not confident about.",
     input_schema: {
       type: "object",
@@ -794,6 +1092,10 @@ export async function runTool(
 ): Promise<{ ok: boolean; result: unknown; activate: string[]; image?: ToolImage }> {
   const tool = byName.get(name);
   if (!tool) return { ok: false, result: { error: `Unknown tool ${name}` }, activate: [] };
+  if (ctx.channel && ctx.channel !== "pc" && REMOTE_BLOCKED.has(name)) {
+    const from = ctx.channel === "telegram" ? "from the phone" : "in a routine";
+    return { ok: false, result: { error: `Not ${from} — that acts on the PC itself. Sir can do it when he's at the computer.` }, activate: [] };
+  }
   const parsed = tool.schema.safeParse(input);
   if (!parsed.success) {
     return { ok: false, result: { error: "INVALID_INPUT", issues: parsed.error.issues.slice(0, 5) }, activate: [] };
@@ -801,6 +1103,9 @@ export async function runTool(
   const base = [`skill:${name}`, `hub:${tool.hub}`];
   try {
     const out = await tool.run(parsed.data, ctx);
+    const result = isOutcome(out) ? out.result : out;
+    // Quick code edits show in the coding panel too, not only background coding tasks.
+    if (QUICK_CODE.has(name)) recordQuickCode({ tool: name, input: parsed.data as Record<string, unknown>, result, request: ctx.userText ?? "", brain: ctx.brain ?? "deep" });
     if (isOutcome(out)) return { ok: true, result: out.result, activate: [...base, ...out.activate], image: out.image };
     return { ok: true, result: out, activate: base };
   } catch (err) {

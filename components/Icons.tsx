@@ -43,6 +43,11 @@ export const HistoryIcon = (p: P) => (
     <path d="M4 4v4.6h4.6M12 8v4l3 2" />
   </svg>
 );
+export const ListIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="m4 6.5 1.5 1.5L8 5.5M4 12.5 5.5 14 8 11.5M4.5 18h3M11 7h9M11 13h9M11 18h9" />
+  </svg>
+);
 export const CloseIcon = (p: P) => (
   <svg {...base} {...p}>
     <path d="m6 6 12 12M18 6 6 18" />

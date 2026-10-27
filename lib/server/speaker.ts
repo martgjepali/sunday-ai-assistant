@@ -125,7 +125,9 @@ export type ChatSecurity =
   | { ok: false }
   | { ok: true; via: "off" }
   | { ok: true; via: "voice"; similarity: number }
-  | { ok: true; via: "recent-voice"; heardAgoMin: number };
+  | { ok: true; via: "recent-voice"; heardAgoMin: number }
+  | { ok: true; via: "telegram" }
+  | { ok: true; via: "routine" };
 
 export function allowChat(mode: "voice" | "text", token?: string | null): ChatSecurity {
   if (!ownerVoice()) return { ok: true, via: "off" };

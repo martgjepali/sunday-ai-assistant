@@ -79,7 +79,8 @@ export type SystemStatus = {
   stt: "deepgram" | "none";
   wake: { ready: true; modelPath: string } | { ready: false; missing: string[] };
   typesafe: boolean;
-  gmail: { configured: boolean; account: string | null };
+  gmail: { configured: boolean; account: string | null; calendar: boolean };
+  telegram: { configured: boolean; bot: string | null; paired: string | null; error: string | null };
 };
 
 export type BrainData = {

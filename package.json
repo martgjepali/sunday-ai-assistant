@@ -14,6 +14,7 @@
     "shortcuts": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-shortcuts.ps1"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.311",
     "@anthropic-ai/sdk": "^1.1.0",
     "@elevenlabs/elevenlabs-js": "^2.74.0",
     "@higgsfield/client": "^0.2.6",
