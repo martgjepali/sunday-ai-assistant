@@ -845,6 +845,28 @@ input[type="range"]::-webkit-slider-thumb {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.coding-snippet {
+  margin: 0;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+.coding-snippet figcaption {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  font: 10.5px var(--font-geist-mono), monospace;
+  color: var(--faint);
+}
+.coding-snippet pre {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  font: 11.5px/1.5 var(--font-geist-mono), monospace;
+  color: #cfe3ff;
+  white-space: pre;
+}
 .coding-summary {
   margin: 0;
   font-size: 12.5px;

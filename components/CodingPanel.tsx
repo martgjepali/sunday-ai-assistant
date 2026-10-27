@@ -10,6 +10,8 @@ type Coding =
   | { active: false }
   | {
       active: true;
+      kind: "task" | "quick";
+      snippet: { file: string; label: string; code: string } | null;
       goal: string;
       project: string;
       model: string;
@@ -36,6 +38,12 @@ const STATUS: Record<string, string> = {
   stopped: "Stopped",
 };
 const MARK: Record<string, string> = { read: "↗", search: "⌕", edit: "✎", create: "+", run: "›", web: "◎", agent: "⇢", blocked: "⊘", ask: "?", start: "◆", note: "·" };
+
+/** The first few lines of a code preview. */
+const clip = (code: string, max: number) => {
+  const lines = code.split("\n");
+  return lines.length > max ? `${lines.slice(0, max).join("\n")}\n…` : code;
+};
 
 const clock = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -95,7 +103,9 @@ export function CodingPanel() {
         <span className="coding-dot" />
         <span className="eyebrow">Coding · {STATUS[c.status]}</span>
         <span className="coding-meta">
-          {elapsed} · {/coder/i.test(c.model) ? "local · free" : `${/sonnet/i.test(c.model) ? "quick" : "best"} · $${c.cost.toFixed(2)}`}
+          {c.kind === "quick"
+            ? `${c.model} · quick edit`
+            : `${elapsed} · ${/coder/i.test(c.model) ? "local · free" : `${/sonnet/i.test(c.model) ? "quick" : "best"} · $${c.cost.toFixed(2)}`}`}
         </span>
         <button className="icon-btn ghost" onClick={() => setSmall(true)} aria-label="Minimise coding panel" title="Minimise">
           <span aria-hidden>–</span>
@@ -143,6 +153,15 @@ export function CodingPanel() {
 
       {running && <p className="coding-now">{c.now}</p>}
 
+      {c.snippet && (
+        <figure className="coding-snippet">
+          <figcaption>
+            {c.snippet.file} · {c.snippet.label}
+          </figcaption>
+          <pre>{clip(c.snippet.code, 14)}</pre>
+        </figure>
+      )}
+
       {c.summary && !running && <p className="coding-summary">{c.summary.replace(/\*\*|`/g, "").replace(/^#{1,6}\s+/gm, "")}</p>}
       {c.error && <p className="caption-error">{c.error}</p>}
 
@@ -159,7 +178,7 @@ export function CodingPanel() {
         <span title={c.files.join("\n")}>
           {c.files.length} file{c.files.length === 1 ? "" : "s"} changed · {c.commands} command{c.commands === 1 ? "" : "s"}
         </span>
-        {running && (
+        {running && c.kind === "task" && (
           <button className="btn-ghost danger" onClick={() => act("stop")}>
             Stop
           </button>

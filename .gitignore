@@ -49,3 +49,6 @@ next-env.d.ts
 
 # Speaker-recognition model (26 MB) — download: see README / .env.example
 /models/
+
+# test builds (SUNDAY_DIST_DIR)
+/.next-test/

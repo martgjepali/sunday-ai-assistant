@@ -26,7 +26,8 @@ const TOKEN_TTL_MS = 2 * 60 * 1000;
 /** Typed messages are allowed this long after sir's voice was last recognised. */
 const TEXT_GRACE_MS = 10 * 60 * 1000;
 
-type OwnerVoice = { embeddings: number[][]; centroid: number[]; enrolledAt: number };
+/** embeddings: the enrollment recordings. learned: recent confident matches the voiceprint adapts to. */
+type OwnerVoice = { embeddings: number[][]; centroid: number[]; enrolledAt: number; learned?: number[][] };
 
 const g = globalThis as unknown as {
   __sundaySpeaker?: {
@@ -95,6 +96,31 @@ export function ownerVoice(): OwnerVoice | null {
   return v?.embeddings?.length ? v : null;
 }
 
+/**
+ * Mid-conversation, sir's voice drifts from his enrollment (tired, late at night, further from
+ * the mic) and short commands ("Stop.") give weak voiceprints. Within a few minutes of a confident
+ * match, a somewhat lower score still counts as him; strangers still need the full threshold.
+ */
+const TRUST_MS = 10 * 60_000;
+const TRUSTED_THRESHOLD = THRESHOLD - 0.12;
+const SHORT_CLIP_S = 1.5;
+const SHORT_TRUST_MS = 2 * 60_000;
+const SHORT_THRESHOLD = THRESHOLD - 0.2;
+/** Matches this confident (and long enough) teach the voiceprint how he sounds now. */
+const LEARN_THRESHOLD = THRESHOLD + 0.08;
+const LEARN_EVERY_MS = 30_000;
+const LEARNED_MAX = 40;
+
+type Check = { at: number; similarity: number; ok: boolean; seconds: number; how: "match" | "trusted" | "short" | "refused" };
+const checks = ((g as unknown as { __sundayVoiceChecks?: Check[] }).__sundayVoiceChecks ??= []);
+let strongAt = 0;
+let learnedAt = 0;
+
+/** Recent verification results, for diagnostics ("how well does she know my voice?"). */
+export function voiceChecks() {
+  return checks.slice(-30);
+}
+
 /** Is this clip sir? On success, returns a single-use token for /api/chat. */
 export function verify(samples: Float32Array) {
   const owner = ownerVoice();
@@ -104,16 +130,45 @@ export function verify(samples: Float32Array) {
   // Compare with the averaged voiceprint only: taking the best of several samples
   // gives strangers extra chances to score high.
   const similarity = cosine(result.embedding, owner.centroid);
-  const isOwner = similarity >= THRESHOLD;
+  const now = Date.now();
+  const seconds = samples.length / SAMPLE_RATE;
+  const how: Check["how"] =
+    similarity >= THRESHOLD
+      ? "match"
+      : now - strongAt < TRUST_MS && similarity >= TRUSTED_THRESHOLD
+        ? "trusted"
+        : seconds < SHORT_CLIP_S && now - strongAt < SHORT_TRUST_MS && similarity >= SHORT_THRESHOLD
+          ? "short"
+          : "refused";
+  const isOwner = how !== "refused";
+  checks.push({ at: now, similarity: Math.round(similarity * 100) / 100, ok: isOwner, seconds: Math.round(seconds * 10) / 10, how });
+  if (checks.length > 100) checks.splice(0, checks.length - 100);
+
   let token: string | null = null;
   if (isOwner) {
-    state.ownerHeardAt = Date.now();
+    state.ownerHeardAt = now;
+    if (how === "match") strongAt = now;
+    if (similarity >= LEARN_THRESHOLD && seconds >= SHORT_CLIP_S && now - learnedAt > LEARN_EVERY_MS) learn(owner, result.embedding);
     token = randomBytes(16).toString("hex");
-    state.tokens.set(token, { exp: Date.now() + TOKEN_TTL_MS, similarity });
+    state.tokens.set(token, { exp: now + TOKEN_TTL_MS, similarity });
   } else {
     logActivity("security", "Voice not recognised", similarity.toFixed(2));
   }
   return { enrolled: true as const, owner: isOwner, similarity: Math.round(similarity * 100) / 100, token };
+}
+
+/**
+ * Blends a confidently-matched clip into the voiceprint: half from enrollment (the anchor that
+ * never changes), half from his most recent confident matches — so it follows how he sounds lately.
+ */
+function learn(owner: OwnerVoice, embedding: number[]) {
+  learnedAt = Date.now();
+  const learned = [...(owner.learned ?? []), embedding].slice(-LEARNED_MAX);
+  const mean = (list: number[][]) => list[0].map((_, i) => list.reduce((s, e) => s + e[i], 0) / list.length);
+  const anchor = mean(owner.embeddings);
+  const recent = mean(learned);
+  const centroid = anchor.map((v, i) => v * 0.5 + recent[i] * 0.5);
+  kvSet("owner_voice", { ...owner, learned, centroid } satisfies OwnerVoice);
 }
 
 /**

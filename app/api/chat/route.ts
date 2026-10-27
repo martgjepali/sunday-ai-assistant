@@ -35,11 +35,15 @@ export async function POST(req: Request) {
         }
       };
       emit({ type: "meta", conversationId });
+      // A heartbeat while she works, so the window can tell "still thinking" from "the server died".
+      const heartbeat = setInterval(() => emit({ type: "ping" }), 15_000);
       try {
         await runAgent({ conversationId, userText: text, mode, security, signal: req.signal, emit });
       } catch (err) {
         console.error("[sunday] chat failed:", err);
         emit({ type: "error", message: describeError(err) });
+      } finally {
+        clearInterval(heartbeat);
       }
       if (open) controller.close();
       open = false;

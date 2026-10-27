@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Test builds go to their own folder (SUNDAY_DIST_DIR=.next-test) so they never replace the
+  // build the running SUNDAY is serving — that left her "thinking" forever.
+  distDir: process.env.SUNDAY_DIST_DIR || ".next",
   devIndicators: false,
   // Native speaker-recognition addon: load with Node's require instead of bundling.
   serverExternalPackages: [

@@ -75,8 +75,30 @@ async function startServer() {
   });
   server.on("exit", (code) => {
     server = null;
-    if (!quitting) console.error(`[sunday] server exited with code ${code}`);
+    if (quitting) return;
+    console.error(`[sunday] server exited with code ${code} — restarting`);
+    void restartServer();
   });
+}
+
+/** Brings the server back if it stops while SUNDAY is open (a crash, or her build being replaced). */
+let restarts = [];
+async function restartServer() {
+  const now = Date.now();
+  restarts = restarts.filter((t) => now - t < 5 * 60_000);
+  if (restarts.length >= 5) {
+    dialog.showErrorBox("SUNDAY's core keeps stopping", "It restarted 5 times in 5 minutes. Quit SUNDAY from the tray and start it again.");
+    return;
+  }
+  restarts.push(now);
+  // A rebuild removes the old build first; wait (up to 5 min) for the new one.
+  for (let i = 0; i < 100 && !DEV && !existsSync(path.join(ROOT, ".next", "BUILD_ID")); i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+  if (quitting || server) return;
+  await startServer();
+  if (await waitForServer(60_000)) win?.webContents.reload();
 }
 
 /** A small amber ring with a violet core, drawn in code so no image asset is needed. */

@@ -29,6 +29,7 @@ export type AgentEvent =
   | { type: "activate"; ids: string[] }
   | { type: "request"; id: string; kind: string; payload?: unknown }
   | { type: "done"; text: string }
+  | { type: "ping" }
   | { type: "error"; message: string };
 
 let claude: Anthropic | null = null;
@@ -63,7 +64,8 @@ export async function runAgent(opts: {
   let { brain, why } = await chooseBrain(userText);
   // "Yes, add it anyway" belongs to the brain that asked the question — the local brain may lack the tool.
   const prev = lastBrain.get(conversationId);
-  if (prev && Date.now() - prev.at < FOLLOW_UP_MS && RANK[prev.brain] > RANK[brain] && userText.length <= 80) {
+  // Only in automatic mode, and only for answers like "yes, add it anyway" — a pinned brain stays pinned.
+  if (prev && brainMode() === "auto" && Date.now() - prev.at < FOLLOW_UP_MS && RANK[prev.brain] > RANK[brain] && (FOLLOW_UP.test(userText) || userText.length <= 25)) {
     brain = prev.brain;
     why = "continuing the task it was already handling";
   }
@@ -94,11 +96,12 @@ export async function runAgent(opts: {
         }`
       : "";
     const self = selfNote(brain, why);
+    const files = filesLine(conversationId);
     const system: Anthropic.Beta.MessageCreateParams["system"] = local
-      ? `${LOCAL_PERSONA}\n\n${dynamicContext(userText, mode, security, true).text}\n\n${self}`
+      ? `${LOCAL_PERSONA}\n\n${dynamicContext(userText, mode, security, true).text}${files}\n\n${self}`
       : [
           { type: "text", text: PERSONA, cache_control: { type: "ephemeral" } },
-          { type: "text", text: `${ctx.text}\n\n${self}` },
+          { type: "text", text: `${ctx.text}${files}\n\n${self}` },
           ...(brain === "fast" ? [{ type: "text" as const, text: FAST_NOTE }] : []),
           ...(handNote ? [{ type: "text" as const, text: handNote }] : []),
         ];
@@ -186,6 +189,7 @@ export async function runAgent(opts: {
       const callsTool = message.content.some((b) => b.type === "tool_use" || b.type === "server_tool_use");
       const nothingRan = actions.length === 0;
       // Only looked things up — so "I've added it" can't be true.
+      // Only looked things up (or every change failed) — so "I've updated it" can't be true.
       const onlyLooked = ran.every((name) => LOOK_ONLY.has(name));
       if (!callsTool && message.stop_reason !== "pause_turn") {
         if (local && ((nothingRan && (PROMISE.test(turnText) || UNSEEN.test(turnText))) || (onlyLooked && CLAIM.test(turnText)))) {
@@ -194,7 +198,7 @@ export async function runAgent(opts: {
           handedFrom = { brain, reason: "it said it would do this but has no tool for it" };
           return "handoff";
         }
-        if (nudges < 1 && nothingRan && (PROMISE.test(turnText) || CLAIM.test(turnText))) {
+        if (nudges < 1 && ((nothingRan && PROMISE.test(turnText)) || (onlyLooked && CLAIM.test(turnText)))) {
           nudges++;
           say(turnText.slice(sent));
           pushNudge(
@@ -267,7 +271,10 @@ export async function runAgent(opts: {
             brain,
           });
           actions.push(describeAction(tu.name, tu.input, outcome.ok, outcome.result));
-          ran.push(tu.name);
+          if (outcome.ok) {
+            ran.push(tu.name);
+            noteFiles(conversationId, tu.name, tu.input, outcome.result);
+          }
           emit({
             type: "tool",
             id: tu.id,
@@ -371,6 +378,42 @@ const lastBrain = (g.__sundayLastBrain ??= new Map<string, { brain: Brain; at: n
 const FOLLOW_UP_MS = 10 * 60_000;
 const RANK: Record<Brain, number> = { local: 0, fast: 1, deep: 2 };
 
+/** Short answers that continue what the previous brain asked ("yes", "add it anyway", "the second one"). */
+const FOLLOW_UP = /^\s*(yes|yeah|yep|yup|sure|ok(ay)?|no|nope|go ahead|do it|add it|that one|the (first|second|third|other|last) one|anyway|please do|confirm|cancel)\b/i;
+
+/* ───────── Files in play ───────── */
+
+type FileSeen = { path: string; what: string; at: number };
+const gf = globalThis as unknown as { __sundayFiles?: Map<string, FileSeen[]> };
+const filesSeen = (gf.__sundayFiles ??= new Map<string, FileSeen[]>());
+
+/** Remembers which files a conversation touched, so "that file" always resolves to a real path. */
+function noteFiles(conversationId: string, tool: string, input: unknown, result: unknown) {
+  const i = (input ?? {}) as Record<string, unknown>;
+  const r = (result ?? {}) as Record<string, unknown>;
+  const found: [unknown, string][] = [
+    [r.to, "renamed to"],
+    [r.opened, "opened"],
+    [r.path, tool.replace(/_/g, " ")],
+    [i.path, tool.replace(/_/g, " ")],
+  ];
+  const hit = found.find(([p]) => typeof p === "string" && /[\\/]/.test(p) && /\.\w{1,5}$/.test(p));
+  if (!hit) return;
+  const list = filesSeen.get(conversationId) ?? [];
+  const path = String(hit[0]);
+  const next = [{ path, what: hit[1], at: Date.now() }, ...list.filter((f) => f.path.toLowerCase() !== path.toLowerCase())].slice(0, 6);
+  filesSeen.set(conversationId, next);
+}
+
+/** For the system prompt: the exact paths of files this conversation has worked with. */
+function filesLine(conversationId: string) {
+  const list = filesSeen.get(conversationId);
+  if (!list?.length) return "";
+  return `\nFiles in this conversation (newest first — "that file" means the first; use these exact paths): ${list
+    .map((f) => `${f.path} (${f.what})`)
+    .join("; ")}.`;
+}
+
 /** Tools that only look things up — after just these, a brain can't truthfully say it added or changed anything. */
 const LOOK_ONLY = new Set([
   "recall", "search_files", "list_directory", "file_info", "read_file", "calendar_events", "list_reminders", "tasks_list", "plan_my_day", "routines_list", "code_status", "dev_environment",
@@ -387,7 +430,7 @@ const PROMISE =
   /\b(one moment|just a (moment|sec(ond)?)|give me a (moment|sec(ond)?)|hold on|bear with me|on it|right away|let me (check|look|see|find|fix|get|open|try|search|take a look|have a look|pull)|i'?ll (check|look|see|find|fix|get|open|try|search|take a look|have a look|let you know|get back to you|report back|tell you)|i'?m (checking|looking|searching|on it))\b/i;
 /** Saying it already did something ("I've closed the file") — a lie when no tool ran this turn. */
 const CLAIM =
-  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|added|edited|changed|updated|fixed|set|started|stopped|paused|played|turned|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished|marked|ticked|completed|scheduled|booked|noted|logged|archived|cancell?ed|put|checked off)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed|added|marked|ticked off|scheduled|booked|on (your|the) (list|calendar))\b|^\s*done\b/i;
+  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|added|edited|changed|updated|fixed|set|started|stopped|paused|played|turned|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished|marked|ticked|completed|scheduled|booked|noted|logged|archived|cancell?ed|put|checked off)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed|added|marked|ticked off|scheduled|booked|on (your|the) (list|calendar))\b|\b(has|have) been (created|updated|edited|changed|saved|added|modified|fixed|renamed|moved|written|deleted|removed|opened|closed)\b|\bis now (updated|saved|fixed|changed|printing|set)\b|^\s*done\b/i;
 /** Talking about his screen or open windows — the local brain can't see either. */
 const UNSEEN =
   /\b(on (your|the) screen|(can|can't|cannot|don't|do not) see (any|it|that|the|your|anything|an?)\b|currently open|you have open|(is|are) open (right now|now)?)/i;

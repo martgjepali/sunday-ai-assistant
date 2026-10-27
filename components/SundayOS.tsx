@@ -612,7 +612,17 @@ function SystemsPanel({
           </span>
         </li>
         <li>
-          <span className="sys-led" data-ok={String(Object.values(status.index).every((d) => d.state === "done"))} />
+          {/* green when indexed, amber while indexing, red only when a drive failed */}
+          <span
+            className="sys-led"
+            data-ok={(() => {
+              const states = Object.values(status.index).map((d) => d.state);
+              return states.some((s) => s === "error") ? "false" : states.every((s) => s === "done") ? "true" : "partial";
+            })()}
+            title={Object.entries(status.index)
+              .map(([d, s]) => `${d.slice(0, 2)} ${s.state}`)
+              .join(", ")}
+          />
           <span className="sys-name">Drives</span>
           <span className="sys-value">
             {Object.entries(status.index)

@@ -515,8 +515,7 @@ export function recordQuickCode(e: { tool: string; input: Record<string, unknown
     q!.events.push({ at: now, kind, text: text.slice(0, 220) });
     if (q!.events.length > 40) q!.events.splice(0, q!.events.length - 40);
   };
-  const lines = (code: unknown) => String(code ?? "").split(/?
-/).length;
+  const lines = (code: unknown) => String(code ?? "").split(/\r?\n/).length;
   switch (e.tool) {
     case "create_text_file":
     case "write_file":

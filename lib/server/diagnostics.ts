@@ -20,7 +20,19 @@ import {
 } from "./brains";
 import { FAST_MODEL, IMAGE_MAX_USD, IMAGE_MODEL, LOCAL_BASE_MODEL, LOCAL_KEEP_ALIVE, LOCAL_MODEL, MODEL, OLLAMA_URL, driveRoots, features } from "./config";
 import { indexerStatus } from "./indexer";
-import { ownerVoice, voiceIdDisabled } from "./speaker";
+import { ownerVoice, voiceChecks, voiceIdDisabled, voiceThreshold } from "./speaker";
+
+/** "last 12 checks: 10 passed (avg match 0.71, 2 via trust), 2 refused (0.41, 0.38)" */
+function voiceSummary() {
+  const c = voiceChecks();
+  if (!c.length) return "no voice checks since SUNDAY started";
+  const ok = c.filter((x) => x.ok);
+  const bad = c.filter((x) => !x.ok);
+  const avg = ok.length ? (ok.reduce((s, x) => s + x.similarity, 0) / ok.length).toFixed(2) : "–";
+  const trusted = ok.filter((x) => x.how !== "match").length;
+  const learned = ownerVoice()?.learned?.length ?? 0;
+  return `last ${c.length} checks: ${ok.length} passed (avg ${avg}, threshold ${voiceThreshold()}${trusted ? `, ${trusted} via conversation trust` : ""}), ${bad.length} refused${bad.length ? ` (${bad.slice(-4).map((x) => `${x.similarity} over ${x.seconds}s`).join(", ")})` : ""}; voiceprint has learned from ${learned} recent clips`;
+}
 import { gmailAccount } from "./tools/gmail";
 import { typesafeEnabled } from "./typesafe";
 import { voiceStatus, wakeWordConfig } from "./voice";
@@ -219,7 +231,7 @@ function checkSenses(problems: string[]) {
     voice: voice.elevenlabs ? "ElevenLabs" : "browser voice",
     ears: features.deepgram() ? "Deepgram live" : "off",
     wakeWord: wake.ready ? "armed" : "not ready",
-    voiceId: voiceIdDisabled() ? "turned off (SUNDAY_VOICE_ID=off)" : owner ? "enrolled — strangers refused" : "not set up",
+    voiceId: voiceIdDisabled() ? "turned off (SUNDAY_VOICE_ID=off)" : owner ? `enrolled — strangers refused; ${voiceSummary()}` : "not set up",
     instinct: typesafeEnabled() ? "Jev (TypeSafe) on" : "off",
     gmail: gmailAccount() ?? (features.google() ? "not connected" : "not configured"),
     images: features.higgsfield() ? `Higgsfield (${IMAGE_MODEL}, max $${IMAGE_MAX_USD} per request)` : "not connected (HF_CREDENTIALS missing from .env.local)",

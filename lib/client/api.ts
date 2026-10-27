@@ -44,25 +44,51 @@ export async function verifyVoice(pcm: Int16Array): Promise<VoiceCheck | null> {
   }
 }
 
+/** The server sends a heartbeat every 15s while it works; this much silence means it's gone. */
+const SILENCE_MS = 45_000;
+
 export async function* streamChat(
   body: { conversationId: string | null; text: string; mode: "voice" | "text"; voiceToken?: string | null },
   signal: AbortSignal,
 ): AsyncGenerator<AgentEvent> {
-  const res = await api("/api/chat", { method: "POST", body: JSON.stringify(body), signal });
-  if (res.status === 403) throw new NotOwnerError();
-  if (!res.ok || !res.body) throw new Error(`SUNDAY's core answered ${res.status}`);
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += value;
-    let nl: number;
-    while ((nl = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, nl).trim();
-      buffer = buffer.slice(nl + 1);
-      if (line) yield JSON.parse(line) as AgentEvent;
+  const watchdog = new AbortController();
+  let silent = false;
+  const expire = () => {
+    silent = true;
+    watchdog.abort();
+  };
+  let timer = setTimeout(expire, SILENCE_MS);
+  const heard = () => {
+    clearTimeout(timer);
+    timer = setTimeout(expire, SILENCE_MS);
+  };
+  try {
+    const res = await api("/api/chat", { method: "POST", body: JSON.stringify(body), signal: AbortSignal.any([signal, watchdog.signal]) });
+    if (res.status === 403) throw new NotOwnerError();
+    if (!res.ok || !res.body) throw new Error(`SUNDAY's core answered ${res.status}`);
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      heard();
+      buffer += value;
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line) as AgentEvent;
+        if (ev.type !== "ping") yield ev;
+      }
     }
+  } catch (err) {
+    if (silent && !signal.aborted) {
+      throw new Error("SUNDAY's core stopped answering — it may be restarting. Give it a few seconds and ask again.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
