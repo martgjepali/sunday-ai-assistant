@@ -15,7 +15,7 @@ if (typeof require("electron") === "string") {
 
 const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage, shell, session, dialog, powerMonitor, desktopCapturer, screen } = require("electron");
 const { spawn } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { createWriteStream, existsSync, mkdirSync, statSync } = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 
@@ -70,15 +70,43 @@ async function startServer() {
   server = spawn(process.env.SUNDAY_NODE || "node", [nextBin, DEV ? "dev" : "start", "-H", "127.0.0.1", "-p", String(PORT)], {
     cwd: ROOT,
     env: { ...process.env, PORT: String(PORT), SUNDAY_PORT: String(PORT) },
-    stdio: "inherit",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  server.on("exit", (code) => {
+  writeLog(`server started (pid ${server.pid})`);
+  server.stdout.on("data", (d) => toLog(d));
+  server.stderr.on("data", (d) => toLog(d));
+  server.on("exit", (code, signal) => {
     server = null;
-    if (quitting) return;
-    console.error(`[sunday] server exited with code ${code} — restarting`);
+    if (quitting) return writeLog("server stopped (SUNDAY quit)");
+    writeLog(`server exited unexpectedly (code ${code}${signal ? `, signal ${signal}` : ""}) — restarting`);
     void restartServer();
   });
+}
+
+/* SUNDAY's server log: .sunday-data/logs/sunday-YYYY-MM-DD.log — so a crash always leaves a trace. */
+const LOG_DIR = path.join(ROOT, ".sunday-data", "logs");
+const LOG_CAP = 20 * 1024 * 1024; // stop writing a day's log past 20 MB
+let log = { day: "", stream: null };
+function logStream() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (log.day !== day) {
+    log.stream?.end();
+    mkdirSync(LOG_DIR, { recursive: true });
+    log = { day, stream: createWriteStream(path.join(LOG_DIR, `sunday-${day}.log`), { flags: "a" }) };
+  }
+  return log.stream;
+}
+function toLog(chunk) {
+  process.stdout.write(chunk);
+  try {
+    const file = path.join(LOG_DIR, `sunday-${new Date().toISOString().slice(0, 10)}.log`);
+    if (existsSync(file) && statSync(file).size > LOG_CAP) return;
+    logStream().write(chunk);
+  } catch {}
+}
+function writeLog(line) {
+  toLog(`[${new Date().toLocaleString("en-GB")}] [electron] ${line}\n`);
 }
 
 /** Brings the server back if it stops while SUNDAY is open (a crash, or her build being replaced). */

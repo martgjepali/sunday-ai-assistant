@@ -151,7 +151,7 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
 
   // Speaker is created once; it reads live settings through refs.
   if (!speakerRef.current && typeof window !== "undefined") {
-    speakerRef.current = new Speaker(() => Boolean(statusRef.current?.voice.elevenlabs), {
+    speakerRef.current = new Speaker(() => Boolean(statusRef.current && statusRef.current.voice.engine !== "browser"), {
       onStart: () => setState("speaking"),
       onIdle: () => settle(),
       onError: (msg) => setNotice(msg),

@@ -41,7 +41,7 @@ import { BRAIN_LABEL, setBrainMode, type Brain } from "../brains";
 import { brainDiagnostics, repairBrain } from "../diagnostics";
 import { computerTask } from "../computer";
 import { createDocument } from "../documents";
-import { ASPECT_RATIOS, generateImage, saveImages, sirNamedPlace } from "../images";
+import { ASPECT_RATIOS, generateImage, imageJobsLine, saveImages, sirNamedPlace } from "../images";
 import { addEvent, calendarReady, changeEvent, listEvents, todaysEvents } from "../calendar";
 import { addTasks, changeTask, completeTasks, listTasks, tasksForToday } from "../tasks";
 import { answerApproval, codingState, devEnvironment, recordQuickCode, startCoding, stopCoding } from "../coder";
@@ -1022,28 +1022,58 @@ const TEXT_FILE_TYPES = new Set([
   ".go", ".rs", ".php", ".rb", ".sql", ".sh", ".ps1", ".bat", ".yml", ".yaml", ".toml", ".xml", ".ini",
 ]);
 
-const LOCAL_TOOLS = new Set([
+const LOCAL_TOOLS = [
   "remember", "recall", "search_files", "list_directory", "create_folder", "create_text_file",
-  "open_application", "open_path", "open_url", "browser_search", "close_application", "save_image",
+  "open_application", "open_path", "open_url", "browser_search", "close_application",
   "media_control", "volume", "system_status", "lock_pc", "show_desktop",
-  "set_reminder", "set_timer", "list_reminders", "cancel_reminder", "get_weather", "morning_briefing", "calendar_events",
-  "task_add", "tasks_list", "task_done", "task_change",
-  // light coding: open and read projects, create files, small exact edits, and hand bigger jobs to the (free, local) coding engine
-  "vscode_workspaces", "open_in_vscode", "read_code", "search_in_files", "insert_code", "edit_file", "dev_environment", "code_task", "code_status", "code_stop",
-  "brain_status", "set_brain_mode", "repair_brain",
-]);
+  "set_reminder", "set_timer", "list_reminders", "cancel_reminder", "get_weather", "morning_briefing",
+];
+/**
+ * The local brain re-reads every tool description on each reply, so these groups only come along
+ * when the request (or her last reply, for follow-ups) is about them. A missed group just means a hand-off.
+ * Kept in a fixed order after the core tools, so Ollama can reuse the prompt it already read.
+ */
+const LOCAL_GROUPS: { tools: string[]; when: RegExp }[] = [
+  {
+    tools: ["calendar_events"],
+    when: /\b(calendar|meetings?|appointments?|schedule|events?|agenda|busy|free|plans?|today|tomorrow|tonight|week(end)?|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
+  },
+  {
+    tools: ["task_add", "tasks_list", "task_done", "task_change"],
+    when: /\b(lists?|to-?dos?|tasks?|shopping|groceries|errands?|add|put|bought|buy|got|called|tick|cross|done|finished|archive|need to|have to)\b/i,
+  },
+  { tools: ["save_image"], when: /\b(images?|pictures?|photos?|save|generated)\b/i },
+  {
+    tools: ["brain_status", "set_brain_mode", "repair_brain"],
+    when: /\b(brains?|models?|local|haiku|opus|sonnet|claude|ollama|qwen|gpu|repair|diagnos\w*|health|mode|switch|which ai)\b/i,
+  },
+  {
+    // light coding: open and read projects, create files, small exact edits, and hand bigger jobs to the (free, local) coding engine
+    tools: ["vscode_workspaces", "open_in_vscode", "read_code", "search_in_files", "insert_code", "edit_file", "dev_environment", "code_task", "code_status", "code_stop"],
+    when: /\b(code|coding|coder|vs ?code|visual studio|projects?|repo|scripts?|functions?|class|imports?|python|javascript|typescript|html|css|java|programs?|website|compile|build|debug|edit|insert|lines?|files?|documents?|notepad)\b|\.(py|js|ts|tsx|jsx|html|css|json|cs|cpp|java|go|rs|txt|md)\b/i,
+  },
+];
+
+/** The local brain's tools for this request: the core set, plus the groups `about` touches (all of them when it's not given). */
+function localToolNames(about?: string) {
+  // Work already underway keeps its tools: a coding run, or images waiting to be saved.
+  const underway = (g: { tools: string[] }) =>
+    (g.tools.includes("code_status") && codingState().active) || (g.tools.includes("save_image") && Boolean(imageJobsLine()));
+  return [...LOCAL_TOOLS, ...LOCAL_GROUPS.filter((g) => about === undefined || g.when.test(about) || underway(g)).flatMap((g) => g.tools)];
+}
 /** Only the deep brain drives the computer or edits code. */
 const DEEP_ONLY = new Set(["computer_task", "write_file", "use_skill", "blender_run_python", "blender_look", "blender_import"]);
 
 /** Not a real tool: the local and fast brains call it to pass a request up. */
 export const HAND_OFF = "hand_off";
 
-export function toolSchemas(brain: Brain = "deep", channel: Channel = "pc"): Anthropic.Beta.BetaToolUnion[] {
-  const offered = TOOLS.filter(
-    (t) =>
-      (brain === "deep" ? true : brain === "local" ? LOCAL_TOOLS.has(t.name) : !DEEP_ONLY.has(t.name)) &&
-      !(channel !== "pc" && REMOTE_BLOCKED.has(t.name)),
-  );
+/** `about` (the request, plus her last reply) picks the local brain's tool groups. */
+export function toolSchemas(brain: Brain = "deep", channel: Channel = "pc", about?: string): Anthropic.Beta.BetaToolUnion[] {
+  const chosen =
+    brain === "local"
+      ? localToolNames(about).flatMap((name) => TOOLS.filter((t) => t.name === name))
+      : TOOLS.filter((t) => brain === "deep" || !DEEP_ONLY.has(t.name));
+  const offered = chosen.filter((t) => !(channel !== "pc" && REMOTE_BLOCKED.has(t.name)));
   const custom = offered.map((t) => {
     const { $schema: _ignored, ...schema } = z.toJSONSchema(t.schema) as Record<string, unknown>;
     return {
@@ -1074,6 +1104,8 @@ export function toolSchemas(brain: Brain = "deep", channel: Channel = "pc"): Ant
       required: ["reason"],
     },
   };
+  // Local: hand_off sits before the groups that come and go, keeping the start of the prompt identical.
+  if (brain === "local") return [handOff, ...custom];
   return [
     ...custom,
     handOff,

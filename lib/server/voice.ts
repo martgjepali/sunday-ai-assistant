@@ -2,6 +2,7 @@ import "server-only";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { kvGet, kvSet } from "./db";
+import { kokoroAvailable, kokoroVoice } from "./kokoro";
 
 const SAMPLE = path.join(process.cwd(), "public", "sunday_voice", "sunday.mp3");
 const WAKE_DIR = path.join(process.cwd(), "public", "wake");
@@ -106,8 +107,21 @@ async function cloneVoice(): Promise<string> {
   return voice_id;
 }
 
+/**
+ * Which voice SUNDAY speaks with. Kokoro (free, unlimited, on this PC) unless sir sets
+ * SUNDAY_VOICE_ENGINE=elevenlabs — even then Kokoro covers for ElevenLabs when its credits run out.
+ */
+export function voiceEngine(): "kokoro" | "elevenlabs" | "browser" {
+  const eleven = Boolean(process.env.ELEVENLABS_API_KEY);
+  if (process.env.SUNDAY_VOICE_ENGINE?.toLowerCase() === "elevenlabs" && eleven) return "elevenlabs";
+  if (kokoroAvailable()) return "kokoro";
+  return eleven ? "elevenlabs" : "browser";
+}
+
 export function voiceStatus() {
   return {
+    engine: voiceEngine(),
+    kokoroVoice: kokoroAvailable() ? kokoroVoice() : null,
     elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY),
     voiceId: process.env.ELEVENLABS_VOICE_ID ?? kvGet<string>("elevenlabs_voice_id") ?? null,
     sample: existsSync(SAMPLE),

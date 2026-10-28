@@ -103,11 +103,36 @@ const FAST_WORK = new RegExp(
   "i",
 );
 
+/**
+ * Coding goes to Claude even with the local brain pinned — sir's choice: the local model got stuck on
+ * edits and couldn't find bugs. Debugging gets the deep brain, other coding the fast one.
+ * Speech-to-text spellings included ("page. T s x", "DSX").
+ */
+const CODE_DEBUG = new RegExp(
+  [
+    String.raw`\b(debug\w*|refactor\w*|stack ?trace|lint(er|ing)?|code review|review (my|the|this) code)\b`,
+    String.raw`\b(fix|find|track down|check|what'?s causing) (a |an |the |this |that |my |these |those )?(bug|error|crash|issue|exception|problem)s?\b`,
+    String.raw`\b(errors?|bugs?|exceptions?|warnings?) (in|on|with|from)\b`,
+    String.raw`\b(getting|having|seeing|there are|we have|i have|i'?ve got) (a |an |some |a bunch of |lots of |many )?(errors?|bugs?|red (lines|squiggles))\b`,
+    String.raw`\b(won'?t|doesn'?t|does not|will not|can'?t) (run|compile|build|start|work|load)\b|\b(build|compile) (is |was )?(fail\w*|broke\w*|error\w*)\b`,
+  ].join("|"),
+  "i",
+);
+const CODE_WORK =
+  /\b(code|coding|function|script|program|algorithm|class|component|python|javascript|typescript|react|next\.?\s?js|node\.?\s?js|npm|npx|install\w*|project|app folder|front ?end|back ?end|website|web ?app|single page|api|database|compile|syntax|variable|import|t\.? ?s\.? ?x|d ?s ?x|j\.? ?s\.? ?x|tsx|jsx)\b|\.(py|js|mjs|cjs|ts|tsx|jsx|html|css|json)\b|\bdot (py|js|ts|tsx|jsx|html|css|json)\b/i;
+export const CODING_WHY = "coding goes to Claude even with the local brain pinned";
+/** True when this brain was picked by the coding rule, so follow-ups ("now use quick sort") stay with it. */
+export const isCodingRoute = (why: string) => why.includes(CODING_WHY);
+
 /** Picks the brain for this message: sir's pinned choice, or the cheapest that can do it well. */
 export async function chooseBrain(text: string): Promise<{ brain: Brain; why: string }> {
   if (FORCE_DEEP.test(text)) return { brain: "deep", why: "asked for full power on this one" };
   const mode = brainMode();
   if (mode === "fast" || mode === "deep") return { brain: mode, why: `sir pinned the ${BRAIN_LABEL[mode]} brain` };
+  if (mode === "local" && !FORCE_LOCAL.test(text)) {
+    if (CODE_DEBUG.test(text)) return { brain: "deep", why: `debugging — ${CODING_WHY}` };
+    if (CODE_WORK.test(text)) return { brain: "fast", why: CODING_WHY };
+  }
 
   const wantsLocal = mode === "local" || FORCE_LOCAL.test(text);
   if (!wantsLocal && DEEP_WORK.test(text)) return { brain: "deep", why: "coding, documents or computer use" };

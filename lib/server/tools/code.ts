@@ -167,9 +167,91 @@ function looseMatch(original: string, snippet: string) {
   return found;
 }
 
+/**
+ * Python: parses the file (never runs it) and flags a name that's used but defined nowhere in it —
+ * e.g. still calling insertion_sort() after the function was renamed. Skipped for `from x import *`.
+ */
+const PY_CHECK = `import ast, sys, builtins
+t = ast.parse(open(sys.argv[1], encoding='utf-8-sig').read(), sys.argv[1])
+known = set(dir(builtins)) | {'__file__', '__name__', '__doc__', '__spec__', '__loader__', '__package__', '__path__', '__builtins__', '__class__'}
+star = False
+for n in ast.walk(t):
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)): known.add(n.name)
+    elif isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load): known.add(n.id)
+    elif isinstance(n, ast.arg): known.add(n.arg)
+    elif isinstance(n, (ast.Import, ast.ImportFrom)):
+        for a in n.names:
+            star = star or a.name == '*'
+            known.add((a.asname or a.name).split('.')[0])
+    elif isinstance(n, (ast.Global, ast.Nonlocal)): known.update(n.names)
+    elif getattr(n, 'name', None) and type(n).__name__ in ('ExceptHandler', 'MatchAs', 'MatchStar', 'TypeVar', 'ParamSpec', 'TypeVarTuple'): known.add(n.name)
+    elif getattr(n, 'rest', None) and type(n).__name__ == 'MatchMapping': known.add(n.rest)
+if not star:
+    for n in ast.walk(t):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in known:
+            sys.exit('line %d: %s is used but never defined in this file (renamed or removed?)' % (n.lineno, n.id))`;
+
+/**
+ * A quick check after a change (Python, JavaScript, JSON), so a broken edit is caught before
+ * she tells sir it worked. Null when the file is fine — or can't be checked (no Python installed, other languages).
+ */
+async function syntaxProblem(p: string): Promise<string | null> {
+  const ext = win.extname(p).toLowerCase();
+  if (ext === ".json") {
+    try {
+      JSON.parse((await fs.readFile(p, "utf8")).replace(/^﻿/, ""));
+      return null;
+    } catch (err) {
+      return `JSON error: ${(err as Error).message}`;
+    }
+  }
+  const check =
+    ext === ".py"
+      ? // ast.parse only reads the file — py_compile would leave __pycache__ folders in his project.
+        { exe: "python", args: ["-c", PY_CHECK, p], env: {} }
+      : [".js", ".mjs", ".cjs"].includes(ext)
+        ? { exe: process.execPath, args: ["--check", p], env: { ELECTRON_RUN_AS_NODE: "1" } }
+        : null;
+  if (!check) return null;
+  return new Promise((resolve) => {
+    let stderr = "";
+    const child = spawn(check.exe, check.args, { env: { ...process.env, ...check.env }, windowsHide: true, timeout: 8000 });
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", () => resolve(null));
+    child.on("close", (code) =>
+      resolve(code === 0 || !stderr.trim() ? null : stderr.trim().split(/\r?\n/).slice(-4).join(" ").replace(/\s+/g, " ").slice(0, 400)),
+    );
+  });
+}
+
+/** Adds the syntax check's verdict to a tool result. */
+async function checked<T extends { note: string }>(p: string, result: T) {
+  const problem = await syntaxProblem(p);
+  return problem
+    ? { ...result, syntax_error: problem, note: "Saved, but the file now has an error — fix it (read_code, then edit_file) before telling sir it's done." }
+    : result;
+}
+
+/**
+ * Changes to the same file wait their turn. A brain often sends two edits at once; run together,
+ * each reads the old file and the second save wipes out the first.
+ */
+const fileQueues = new Map<string, Promise<unknown>>();
+function oneAtATime<T>(p: string, run: () => Promise<T>): Promise<T> {
+  const key = p.toLowerCase();
+  const next = (fileQueues.get(key) ?? Promise.resolve()).catch(() => {}).then(run);
+  fileQueues.set(key, next);
+  next.finally(() => fileQueues.get(key) === next && fileQueues.delete(key)).catch(() => {});
+  return next;
+}
+
 /** Adds new code without matching anything: at the end, the start, or before a line number from read_code. */
 export async function insertCode(input: string, text: string, at: "end" | "start" | number) {
   const p = resolveUserPath(input);
+  return oneAtATime(p, () => insertCodeNow(p, text, at));
+}
+
+async function insertCodeNow(p: string, text: string, at: "end" | "start" | number) {
   await assertEditable(p);
   const original = await readText(p);
   const eol = original.includes("\r\n") ? "\r\n" : "\n";
@@ -192,11 +274,15 @@ export async function insertCode(input: string, text: string, at: "end" | "start
   await fs.writeFile(p, lines.join(eol), "utf8");
   recordOp("edit", backup, p);
   logActivity("code", win.basename(p), p);
-  return { path: p, inserted_at_line: index + 1, lines: block.length, note: "Saved. Undo restores the previous version." };
+  return checked(p, { path: p, inserted_at_line: index + 1, lines: block.length, note: "Saved. Undo restores the previous version." });
 }
 
 export async function editFile(input: string, oldText: string, newText: string, replaceAll = false) {
   const p = resolveUserPath(input);
+  return oneAtATime(p, () => editFileNow(p, oldText, newText, replaceAll));
+}
+
+async function editFileNow(p: string, oldText: string, newText: string, replaceAll: boolean) {
   await assertEditable(p);
   const original = await readText(p);
 
@@ -228,11 +314,15 @@ export async function editFile(input: string, oldText: string, newText: string, 
   await fs.writeFile(p, updated, "utf8");
   recordOp("edit", backup, p);
   logActivity("code", win.basename(p), p);
-  return { path: p, replacements: replaceAll ? hits : 1, line: firstLine, note: "Saved. Undo restores the previous version." };
+  return checked(p, { path: p, replacements: replaceAll ? hits : 1, line: firstLine, note: "Saved. Undo restores the previous version." });
 }
 
 export async function writeFile(input: string, content: string, overwrite = false) {
   const p = resolveUserPath(input);
+  return oneAtATime(p, () => writeFileNow(p, content, overwrite));
+}
+
+async function writeFileNow(p: string, content: string, overwrite: boolean) {
   await assertEditable(p);
   await assertEditable(await realOrSelf(win.dirname(p)));
   const exists = existsSync(p);
@@ -252,7 +342,7 @@ export async function writeFile(input: string, content: string, overwrite = fals
     indexPath(p, false);
   }
   logActivity("code", win.basename(p), p);
-  return { path: p, created: !exists, lines: content.split("\n").length, note: "Saved. Undo reverts it." };
+  return checked(p, { path: p, created: !exists, lines: content.split("\n").length, note: "Saved. Undo reverts it." });
 }
 
 /* ───────────── Searching inside a project ───────────── */

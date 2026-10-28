@@ -537,8 +537,15 @@ function SystemsPanel({
     },
     {
       name: "Voice",
-      ok: status.voice.elevenlabs ? true : "partial",
-      value: status.voice.elevenlabs ? (status.voice.voiceId ? "SUNDAY voice ready" : "clones on first reply") : "browser voice (add ElevenLabs key)",
+      ok: status.voice.engine === "browser" ? "partial" : true,
+      value:
+        status.voice.engine === "kokoro"
+          ? `Kokoro · ${status.voice.kokoroVoice} · free, on this PC`
+          : status.voice.engine === "elevenlabs"
+            ? status.voice.voiceId
+              ? "ElevenLabs · SUNDAY voice"
+              : "ElevenLabs · clones on first reply"
+            : "browser voice (no voice engine)",
     },
     { name: "Ears", ok: status.stt === "deepgram", value: status.stt === "deepgram" ? "Deepgram live" : "DEEPGRAM_API_KEY missing" },
     {

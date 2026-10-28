@@ -101,7 +101,7 @@ export type SystemStatus = {
   brains: { mode: BrainMode; local: { model: string; ready: boolean; reason?: string }; fast: string };
   drives: string[];
   index: Record<string, { state: string; count: number; finishedAt?: number }>;
-  voice: { elevenlabs: boolean; voiceId: string | null; sample: boolean };
+  voice: { engine: "kokoro" | "elevenlabs" | "browser"; kokoroVoice: string | null; elevenlabs: boolean; voiceId: string | null; sample: boolean };
   stt: "deepgram" | "none";
   wake: { ready: true; modelPath: string } | { ready: false; missing: string[] };
   typesafe: boolean;

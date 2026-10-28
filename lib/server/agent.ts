@@ -2,12 +2,14 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   BRAIN_LABEL,
+  CODING_WHY,
   brainFacts,
   brainSpoken,
   brainMode,
   brainModel,
   chooseBrain,
   escalate,
+  isCodingRoute,
   markLocalDown,
   recordBrainRun,
   warmLocal,
@@ -68,7 +70,13 @@ export async function runAgent(opts: {
   if (prev && brainMode() === "auto" && Date.now() - prev.at < FOLLOW_UP_MS && RANK[prev.brain] > RANK[brain] && (FOLLOW_UP.test(userText) || userText.length <= 25)) {
     brain = prev.brain;
     why = "continuing the task it was already handling";
+  } else if (prev?.coding && brain === "local" && Date.now() - prev.at < FOLLOW_UP_MS && userText.length <= 120) {
+    // With the local brain pinned, coding goes to Claude — and so does "now use quick sort instead" right after it.
+    brain = prev.brain;
+    why = `continuing the coding task — ${CODING_WHY}`;
   }
+  // Decided before any hand-off rewrites `why`, so the next message still knows this was coding.
+  const codingTask = isCodingRoute(why);
   let spoken = "";
   /** What really ran this turn — stored with the reply so later turns can trust it. */
   const actions: string[] = [];
@@ -88,17 +96,24 @@ export async function runAgent(opts: {
       ? history.slice(-LOCAL_HISTORY).map((m) => (typeof m.content === "string" ? { ...m, content: m.content.replace(ACTIONS_NOTE, "") } : m))
       : history;
     while (base.length && base[0].role !== "user") base = base.slice(1);
-    const messages: Anthropic.Beta.BetaMessageParam[] = [...base, { role: "user", content: userText }];
+    const self = selfNote(brain, why);
+    const files = filesLine(conversationId);
+    // Ollama reuses the part of the prompt that hasn't changed since last time. Its template puts the
+    // system prompt before the tools, so the local brain's changing context (the time, his calendar…)
+    // rides with his message instead — otherwise every reply re-reads thousands of tokens of tools.
+    const live = local ? `${dynamicContext(userText, mode, security, true).text}${files}\n\n${self}` : "";
+    const messages: Anthropic.Beta.BetaMessageParam[] = [
+      ...base,
+      { role: "user", content: local ? `${LIVE_OPEN}\n${live}\n${LIVE_CLOSE}\n\n${userText}` : userText },
+    ];
 
     const handNote = handedFrom
       ? `This request was handed to you by SUNDAY's ${BRAIN_LABEL[handedFrom.brain]} brain (${handedFrom.reason}). Sir only hears one SUNDAY — just carry on.${
           actions.length ? ` Already done this turn:\n${actions.join("\n")}` : ""
         }`
       : "";
-    const self = selfNote(brain, why);
-    const files = filesLine(conversationId);
     const system: Anthropic.Beta.MessageCreateParams["system"] = local
-      ? `${LOCAL_PERSONA}\n\n${dynamicContext(userText, mode, security, true).text}${files}\n\n${self}`
+      ? LOCAL_PERSONA
       : [
           { type: "text", text: PERSONA, cache_control: { type: "ephemeral" } },
           { type: "text", text: `${ctx.text}${files}\n\n${self}` },
@@ -117,11 +132,22 @@ export async function runAgent(opts: {
           ? { max_tokens: 16000, output_config: { effort: "low" as const } }
           : // Qwen's thinking mode costs seconds per reply; everyday asks don't need it.
             { max_tokens: 1500, thinking: { type: "disabled" as const } };
-    const tools = toolSchemas(brain, channel);
+    // Recent files keep the coding tools on hand for follow-ups like "now add a comment to it".
+    const recentFile = (filesSeen.get(conversationId)?.[0]?.at ?? 0) > Date.now() - FOLLOW_UP_MS;
+    const tools = toolSchemas(brain, channel, local ? `${userText}\n${lastReply}${recentFile ? "\nfile" : ""}` : undefined);
     let jsonRetries = 0;
     let nudges = 0;
+    /** A file this turn left with a syntax error (the code tools check after every change). */
+    let broken: { path: string; error: string } | null = null;
+    let fixNudges = 0;
 
     for (let turn = 0; turn < MAX_TURNS; turn++) {
+      if (local && ran.filter((name) => FILE_CHANGES.has(name)).length > MAX_LOCAL_EDITS) {
+        // Editing in circles (once pasted the same function eight times) — Claude sees what ran and finishes it.
+        recordIssue("local brain", `made more than ${MAX_LOCAL_EDITS} file changes in one reply; handed up`);
+        handedFrom = { brain, reason: "it was going in circles editing the file — check the file and finish the job" };
+        return "handoff";
+      }
       let startedTurnText = false;
       const say = (delta: string) => {
         if (!delta) return;
@@ -149,7 +175,10 @@ export async function runAgent(opts: {
         const at = turnText.indexOf(FAKE_NOTE);
         if (at >= 0) {
           faked = true;
-          if (!local) say(turnText.slice(sent, at).trimEnd());
+          // Cut it from turnText itself, so later checks that say "the rest" can't read the fake note out.
+          turnText = turnText.slice(0, at).trimEnd();
+          if (!local) say(turnText.slice(sent));
+          sent = turnText.length;
           return;
         }
         if (local) return;
@@ -192,6 +221,47 @@ export async function runAgent(opts: {
       // Only looked things up (or every change failed) — so "I've updated it" can't be true.
       const onlyLooked = ran.every((name) => LOOK_ONLY.has(name));
       if (!callsTool && message.stop_reason !== "pause_turn") {
+        // Set inside the tool callbacks below, which TypeScript's narrowing can't see.
+        const stillBroken = broken as { path: string; error: string } | null;
+        if (stillBroken && fixNudges < 2) {
+          // "I'll fix it" and stopping leaves his file broken — keep her on it.
+          fixNudges++;
+          if (!local) say(turnText.slice(sent));
+          pushNudge(
+            messages,
+            message,
+            `(System note: ${stillBroken.path} still has an error: ${stillBroken.error}. Fix it now — read_code, then edit_file — and only then tell sir the result. If you can't, tell him plainly that it's still broken.)`,
+          );
+          continue;
+        }
+        if (local && nudges < 1 && onlyLooked && CLAIM.test(turnText)) {
+          // Small models often report a change instead of making it. One quiet second chance (sir never
+          // heard the claim), so a simple edit stays on the free brain; claiming again hands it up below.
+          nudges++;
+          pushNudge(
+            messages,
+            message,
+            "(System note: nothing has changed — no tool ran this turn, so sir has NOT been told anything yet. Make the change now with a tool — for a file: insert_code to add lines, or read_code then edit_file — then tell him the real result. If you have no tool for it, call hand_off.)",
+          );
+          continue;
+        }
+        if (local && nothingRan && SCREEN.test(userText)) {
+          // Only the Claude brains can look at his screen.
+          handedFrom = { brain, reason: "sir asked about his screen, which it can't see" };
+          return "handoff";
+        }
+        if (local && CLARIFY.test(turnText) && CLARIFY.test(lastReply)) {
+          // Asking sir for details a second time in a row: it's stuck, not missing information.
+          recordIssue("local brain", `kept asking sir for details instead of looking ("${clip(turnText.trim(), 80)}"); handed up`);
+          handedFrom = { brain, reason: "it kept asking sir for details instead of finding them itself" };
+          return "handoff";
+        }
+        if (local && lastReply && sameWords(turnText, lastReply) && !ASK_AGAIN.test(userText)) {
+          // Small models stuck on a request answer with their previous reply, word for word.
+          recordIssue("local brain", `repeated its last reply instead of answering ("${clip(turnText.trim(), 80)}"); handed up`);
+          handedFrom = { brain, reason: "it repeated its last answer instead of doing what sir asked" };
+          return "handoff";
+        }
         if (local && ((nothingRan && (PROMISE.test(turnText) || UNSEEN.test(turnText))) || (onlyLooked && CLAIM.test(turnText)))) {
           // Held back, so sir never hears it — the next brain does the work instead.
           recordIssue("local brain", `promised or described something without a tool ("${clip(turnText.trim(), 80)}"); handed up`);
@@ -274,6 +344,11 @@ export async function runAgent(opts: {
           if (outcome.ok) {
             ran.push(tu.name);
             noteFiles(conversationId, tu.name, tu.input, outcome.result);
+            const r = outcome.result as { path?: unknown; syntax_error?: unknown };
+            if (typeof r.path === "string" && "note" in (outcome.result as object)) {
+              if (typeof r.syntax_error === "string") broken = { path: r.path, error: r.syntax_error };
+              else if (broken?.path === r.path) broken = null;
+            }
           }
           emit({
             type: "tool",
@@ -340,7 +415,7 @@ export async function runAgent(opts: {
 
   const finalText = spoken.trim();
   addMessage(conversationId, "assistant", finalText || "(done)", actions);
-  lastBrain.set(conversationId, { brain, at: Date.now() });
+  lastBrain.set(conversationId, { brain, at: Date.now(), coding: codingTask });
   emit({ type: "done", text: finalText });
 
   reflectOnExchange(conversationId, userText, finalText).catch((err) => {
@@ -373,8 +448,9 @@ You're on ${brainSpoken(brain)}.${pinned} If sir asks which brain or model you'r
 }
 
 /** Which brain finished each conversation's last turn, so short follow-ups stay with it. */
-const g = globalThis as unknown as { __sundayLastBrain?: Map<string, { brain: Brain; at: number }> };
-const lastBrain = (g.__sundayLastBrain ??= new Map<string, { brain: Brain; at: number }>());
+type LastBrain = { brain: Brain; at: number; coding?: boolean };
+const g = globalThis as unknown as { __sundayLastBrain?: Map<string, LastBrain> };
+const lastBrain = (g.__sundayLastBrain ??= new Map<string, LastBrain>());
 const FOLLOW_UP_MS = 10 * 60_000;
 const RANK: Record<Brain, number> = { local: 0, fast: 1, deep: 2 };
 
@@ -394,10 +470,13 @@ function noteFiles(conversationId: string, tool: string, input: unknown, result:
   const found: [unknown, string][] = [
     [r.to, "renamed to"],
     [r.opened, "opened"],
+    [r.project, "coding project"],
     [r.path, tool.replace(/_/g, " ")],
     [i.path, tool.replace(/_/g, " ")],
   ];
-  const hit = found.find(([p]) => typeof p === "string" && /[\\/]/.test(p) && /\.\w{1,5}$/.test(p));
+  // Files, and folders she made or opened — "the app folder in that project" needs the project's real path.
+  const folderTool = /folder|vscode|code_task/.test(tool) || r.project !== undefined;
+  const hit = found.find(([p]) => typeof p === "string" && /[\\/]/.test(p) && (/\.\w{1,5}$/.test(p) || (folderTool && /^[a-z]:[\\/]/i.test(p))));
   if (!hit) return;
   const list = filesSeen.get(conversationId) ?? [];
   const path = String(hit[0]);
@@ -409,7 +488,7 @@ function noteFiles(conversationId: string, tool: string, input: unknown, result:
 function filesLine(conversationId: string) {
   const list = filesSeen.get(conversationId);
   if (!list?.length) return "";
-  return `\nFiles in this conversation (newest first — "that file" means the first; use these exact paths): ${list
+  return `\nFiles and folders in this conversation (newest first — "that file" or "that folder" means the first of its kind; use these exact paths, and look inside them before asking sir where something is): ${list
     .map((f) => `${f.path} (${f.what})`)
     .join("; ")}.`;
 }
@@ -421,8 +500,15 @@ const LOOK_ONLY = new Set([
   "blender_scene", "look_at_screen", "read_clipboard", "vscode_workspaces", "read_code", "search_in_files", "list_skills",
 ]);
 
+/** Tools that change a file — the local brain gets a few per reply before Claude takes over. */
+const FILE_CHANGES = new Set(["edit_file", "insert_code", "write_file", "create_text_file"]);
+const MAX_LOCAL_EDITS = 4;
+
 /** The system's record of what ran, appended to past replies (see conversationHistory). */
 const ACTIONS_NOTE = /\n*<actions_taken>[\s\S]*?<\/actions_taken>/g;
+/** Wraps the local brain's live context inside sir's message, so it can't be mistaken for his words. */
+const LIVE_OPEN = "[SUNDAY's live context — written by her system, not said by sir]";
+const LIVE_CLOSE = "[End of live context. Sir's message:]";
 const FAKE_NOTE = "<actions_taken";
 
 /** Saying it'll do something ("let me check", "one moment") — only fine if a tool actually runs. */
@@ -430,10 +516,23 @@ const PROMISE =
   /\b(one moment|just a (moment|sec(ond)?)|give me a (moment|sec(ond)?)|hold on|bear with me|on it|right away|let me (check|look|see|find|fix|get|open|try|search|take a look|have a look|pull)|i'?ll (check|look|see|find|fix|get|open|try|search|take a look|have a look|let you know|get back to you|report back|tell you)|i'?m (checking|looking|searching|on it))\b/i;
 /** Saying it already did something ("I've closed the file") — a lie when no tool ran this turn. */
 const CLAIM =
-  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|added|edited|changed|updated|fixed|set|started|stopped|paused|played|turned|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished|marked|ticked|completed|scheduled|booked|noted|logged|archived|cancell?ed|put|checked off)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed|added|marked|ticked off|scheduled|booked|on (your|the) (list|calendar))\b|\b(has|have) been (created|updated|edited|changed|saved|added|modified|fixed|renamed|moved|written|deleted|removed|opened|closed)\b|\bis now (updated|saved|fixed|changed|printing|set)\b|^\s*done\b/i;
+  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+|gone ahead and\s+|went ahead and\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|rewritten|rewrote|added|edited|changed|updated|modified|replaced|swapped|switched|converted|turned|inserted|implemented|refactored|corrected|adjusted|reverted|restored|applied|fixed|set|started|stopped|paused|played|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished|marked|ticked|completed|scheduled|booked|noted|logged|archived|cancell?ed|put|checked off|approved|confirmed|allowed|installed|ran|built|launched|downloaded|uploaded)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed|added|replaced|marked|ticked off|scheduled|booked|on (your|the) (list|calendar))\b|\b((has|have) been|was|were|got) (created|updated|edited|changed|saved|added|modified|replaced|swapped|switched|converted|rewritten|inserted|fixed|renamed|moved|written|deleted|removed|opened|closed)\b|\bis now (updated|saved|fixed|changed|replaced|printing|set|using)\b|^\s*done\b/i;
 /** Talking about his screen or open windows — the local brain can't see either. */
 const UNSEEN =
   /\b(on (your|the) screen|(can|can't|cannot|don't|do not) see (any|it|that|the|your|anything|an?)\b|currently open|you have open|(is|are) open (right now|now)?)/i;
+
+/** Asking sir for details ("could you describe the error?", "what would you like me to do?"). */
+const CLARIFY =
+  /\b(could|can|would) you (please )?(provide|describe|confirm|clarify|tell me|check|specify|give|share|explain|paste)\b|\bwhat (errors?|issue|exactly|would you like|do you mean|are you referring)\b[^.?!]*\?/i;
+/** Sir asking about what's on his screen. */
+const SCREEN = /\b(see|look at|check|read|what'?s on|what is on) (my|the) (screen|monitor|display)\b|\bon (my|the) screen\b/i;
+/** Sir asking to hear it again — the only time the same reply twice is right. */
+const ASK_AGAIN = /\b(repeat|again|say that|what did you (just )?say|pardon|come again)\b/i;
+/** The same reply, ignoring case and punctuation. */
+const sameWords = (a: string, b: string) => {
+  const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return norm(a) !== "" && norm(a) === norm(b);
+};
 
 /** Adds a system nudge after the brain's last message so the loop runs another round. */
 function pushNudge(messages: Anthropic.Beta.BetaMessageParam[], message: Anthropic.Beta.BetaMessage, note: string) {

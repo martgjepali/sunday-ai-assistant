@@ -69,7 +69,7 @@ export function BootSequence({ status, nodes, onReveal, onDone }: Props) {
   const readouts: [string, string][] = [
     ["NEURAL CORE", status ? (status.brain ? status.model.toUpperCase() : "NO KEY") : "LINKING"],
     ["NEURAL MAP", nodes ? `${nodes} NEURONS` : "MAPPING"],
-    ["VOICE", status ? (status.voice.elevenlabs ? "ELEVENLABS" : "SYSTEM") : "…"],
+    ["VOICE", status ? status.voice.engine === "browser" ? "SYSTEM" : status.voice.engine.toUpperCase() : "…"],
     ["EARS", status ? (status.stt === "deepgram" ? "DEEPGRAM LIVE" : "OFFLINE") : "…"],
     ["INSTINCT", status ? (status.typesafe ? "JEV ONLINE" : "STANDBY") : "…"],
     ["DRIVES", status ? status.drives.map((d) => d.slice(0, 2)).join(" ") : "…"],

@@ -224,11 +224,16 @@ function checkSenses(problems: string[]) {
   const voice = voiceStatus();
   const wake = wakeWordConfig();
   const owner = ownerVoice();
-  if (!voice.elevenlabs) problems.push("ELEVENLABS_API_KEY is missing, so I speak with the browser's voice.");
+  if (voice.engine === "browser") problems.push("No voice engine (Kokoro model or ElevenLabs key), so I speak with the browser's voice.");
   if (!features.deepgram()) problems.push("DEEPGRAM_API_KEY is missing, so live speech recognition is off.");
   if (!wake.ready) problems.push(`The "Hey Sunday" wake word needs: ${wake.missing.join(", ")}.`);
   return {
-    voice: voice.elevenlabs ? "ElevenLabs" : "browser voice",
+    voice:
+      voice.engine === "kokoro"
+        ? `Kokoro (${voice.kokoroVoice}, free, on this PC${voice.elevenlabs ? "; ElevenLabs available with SUNDAY_VOICE_ENGINE=elevenlabs" : ""})`
+        : voice.engine === "elevenlabs"
+          ? `ElevenLabs${voice.kokoroVoice ? " (Kokoro covers when credits run out)" : ""}`
+          : "browser voice",
     ears: features.deepgram() ? "Deepgram live" : "off",
     wakeWord: wake.ready ? "armed" : "not ready",
     voiceId: voiceIdDisabled() ? "turned off (SUNDAY_VOICE_ID=off)" : owner ? `enrolled — strangers refused; ${voiceSummary()}` : "not set up",
