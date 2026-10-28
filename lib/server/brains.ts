@@ -121,6 +121,9 @@ const CODE_DEBUG = new RegExp(
 const CODE_WORK =
   /\b(code|coding|function|script|program|algorithm|class|component|python|javascript|typescript|react|next\.?\s?js|node\.?\s?js|npm|npx|install\w*|project|app folder|front ?end|back ?end|website|web ?app|single page|api|database|compile|syntax|variable|import|t\.? ?s\.? ?x|d ?s ?x|j\.? ?s\.? ?x|tsx|jsx)\b|\.(py|js|mjs|cjs|ts|tsx|jsx|html|css|json)\b|\bdot (py|js|ts|tsx|jsx|html|css|json)\b/i;
 export const CODING_WHY = "coding goes to Claude even with the local brain pinned";
+/** With the local brain pinned: the Claude brain a coding message goes to, or null to stay local. */
+export const codingRoute = (text: string): "deep" | "fast" | null =>
+  FORCE_LOCAL.test(text) ? null : CODE_DEBUG.test(text) ? "deep" : CODE_WORK.test(text) ? "fast" : null;
 /** True when this brain was picked by the coding rule, so follow-ups ("now use quick sort") stay with it. */
 export const isCodingRoute = (why: string) => why.includes(CODING_WHY);
 
@@ -129,10 +132,8 @@ export async function chooseBrain(text: string): Promise<{ brain: Brain; why: st
   if (FORCE_DEEP.test(text)) return { brain: "deep", why: "asked for full power on this one" };
   const mode = brainMode();
   if (mode === "fast" || mode === "deep") return { brain: mode, why: `sir pinned the ${BRAIN_LABEL[mode]} brain` };
-  if (mode === "local" && !FORCE_LOCAL.test(text)) {
-    if (CODE_DEBUG.test(text)) return { brain: "deep", why: `debugging — ${CODING_WHY}` };
-    if (CODE_WORK.test(text)) return { brain: "fast", why: CODING_WHY };
-  }
+  const coding = mode === "local" ? codingRoute(text) : null;
+  if (coding) return { brain: coding, why: coding === "deep" ? `debugging — ${CODING_WHY}` : CODING_WHY };
 
   const wantsLocal = mode === "local" || FORCE_LOCAL.test(text);
   if (!wantsLocal && DEEP_WORK.test(text)) return { brain: "deep", why: "coding, documents or computer use" };

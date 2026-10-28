@@ -15,7 +15,10 @@ import {
   warmLocal,
   type Brain,
 } from "./brains";
+import { kvGet, kvSet } from "./db";
 import { recordIssue } from "./diagnostics";
+import { ASK_AGAIN, CLAIM, CLARIFY, PROMISE, SCREEN, UNSEEN, sameWords } from "./guards";
+import { recordUsage } from "./spend";
 import { EFFORT, OLLAMA_URL } from "./config";
 import { addMessage, conversationHistory, reflectOnExchange } from "./memory";
 import { requestFromClient } from "./bridge";
@@ -97,7 +100,7 @@ export async function runAgent(opts: {
       : history;
     while (base.length && base[0].role !== "user") base = base.slice(1);
     const self = selfNote(brain, why);
-    const files = filesLine(conversationId);
+    const files = filesLine();
     // Ollama reuses the part of the prompt that hasn't changed since last time. Its template puts the
     // system prompt before the tools, so the local brain's changing context (the time, his calendar…)
     // rides with his message instead — otherwise every reply re-reads thousands of tokens of tools.
@@ -133,7 +136,7 @@ export async function runAgent(opts: {
           : // Qwen's thinking mode costs seconds per reply; everyday asks don't need it.
             { max_tokens: 1500, thinking: { type: "disabled" as const } };
     // Recent files keep the coding tools on hand for follow-ups like "now add a comment to it".
-    const recentFile = (filesSeen.get(conversationId)?.[0]?.at ?? 0) > Date.now() - FOLLOW_UP_MS;
+    const recentFile = (recentFiles()[0]?.at ?? 0) > Date.now() - FOLLOW_UP_MS;
     const tools = toolSchemas(brain, channel, local ? `${userText}\n${lastReply}${recentFile ? "\nfile" : ""}` : undefined);
     let jsonRetries = 0;
     let nudges = 0;
@@ -201,6 +204,8 @@ export async function runAgent(opts: {
       try {
         message = await stream.finalMessage();
         jsonRetries = 0;
+        // The model that answered (a server-side fallback may differ from the one asked for).
+        if (!local) recordUsage(brain === "deep" ? "deep" : "fast", message.model, message.usage);
       } catch (err) {
         // Only an unparseable streamed tool input is retried; API errors and aborts propagate.
         if (err instanceof Anthropic.APIError || signal.aborted || jsonRetries++ >= 2) throw err;
@@ -343,7 +348,7 @@ export async function runAgent(opts: {
           actions.push(describeAction(tu.name, tu.input, outcome.ok, outcome.result));
           if (outcome.ok) {
             ran.push(tu.name);
-            noteFiles(conversationId, tu.name, tu.input, outcome.result);
+            noteFiles(tu.name, tu.input, outcome.result);
             const r = outcome.result as { path?: unknown; syntax_error?: unknown };
             if (typeof r.path === "string" && "note" in (outcome.result as object)) {
               if (typeof r.syntax_error === "string") broken = { path: r.path, error: r.syntax_error };
@@ -460,11 +465,14 @@ const FOLLOW_UP = /^\s*(yes|yeah|yep|yup|sure|ok(ay)?|no|nope|go ahead|do it|add
 /* ───────── Files in play ───────── */
 
 type FileSeen = { path: string; what: string; at: number };
-const gf = globalThis as unknown as { __sundayFiles?: Map<string, FileSeen[]> };
-const filesSeen = (gf.__sundayFiles ??= new Map<string, FileSeen[]>());
+/** Saved, so "that project" still means the right folder after SUNDAY restarts (each start is a new conversation). */
+const FILES_KEY = "recent_files";
+/** How long a file or folder stays "the one we were working on". */
+const FILES_FRESH_MS = 24 * 3600_000;
+const recentFiles = () => (kvGet<FileSeen[]>(FILES_KEY) ?? []).filter((f) => f.at > Date.now() - FILES_FRESH_MS);
 
-/** Remembers which files a conversation touched, so "that file" always resolves to a real path. */
-function noteFiles(conversationId: string, tool: string, input: unknown, result: unknown) {
+/** Remembers which files and folders she touched, so "that file" always resolves to a real path. */
+function noteFiles(tool: string, input: unknown, result: unknown) {
   const i = (input ?? {}) as Record<string, unknown>;
   const r = (result ?? {}) as Record<string, unknown>;
   const found: [unknown, string][] = [
@@ -478,17 +486,16 @@ function noteFiles(conversationId: string, tool: string, input: unknown, result:
   const folderTool = /folder|vscode|code_task/.test(tool) || r.project !== undefined;
   const hit = found.find(([p]) => typeof p === "string" && /[\\/]/.test(p) && (/\.\w{1,5}$/.test(p) || (folderTool && /^[a-z]:[\\/]/i.test(p))));
   if (!hit) return;
-  const list = filesSeen.get(conversationId) ?? [];
   const path = String(hit[0]);
-  const next = [{ path, what: hit[1], at: Date.now() }, ...list.filter((f) => f.path.toLowerCase() !== path.toLowerCase())].slice(0, 6);
-  filesSeen.set(conversationId, next);
+  const next = [{ path, what: hit[1], at: Date.now() }, ...recentFiles().filter((f) => f.path.toLowerCase() !== path.toLowerCase())].slice(0, 6);
+  kvSet(FILES_KEY, next);
 }
 
-/** For the system prompt: the exact paths of files this conversation has worked with. */
-function filesLine(conversationId: string) {
-  const list = filesSeen.get(conversationId);
-  if (!list?.length) return "";
-  return `\nFiles and folders in this conversation (newest first — "that file" or "that folder" means the first of its kind; use these exact paths, and look inside them before asking sir where something is): ${list
+/** For the system prompt: the exact paths of files and folders she has worked with lately. */
+function filesLine() {
+  const list = recentFiles();
+  if (!list.length) return "";
+  return `\nFiles and folders you've worked on lately (newest first — "that file" or "that folder" means the first of its kind; use these exact paths, and look inside them before asking sir where something is): ${list
     .map((f) => `${f.path} (${f.what})`)
     .join("; ")}.`;
 }
@@ -510,29 +517,6 @@ const ACTIONS_NOTE = /\n*<actions_taken>[\s\S]*?<\/actions_taken>/g;
 const LIVE_OPEN = "[SUNDAY's live context — written by her system, not said by sir]";
 const LIVE_CLOSE = "[End of live context. Sir's message:]";
 const FAKE_NOTE = "<actions_taken";
-
-/** Saying it'll do something ("let me check", "one moment") — only fine if a tool actually runs. */
-const PROMISE =
-  /\b(one moment|just a (moment|sec(ond)?)|give me a (moment|sec(ond)?)|hold on|bear with me|on it|right away|let me (check|look|see|find|fix|get|open|try|search|take a look|have a look|pull)|i'?ll (check|look|see|find|fix|get|open|try|search|take a look|have a look|let you know|get back to you|report back|tell you)|i'?m (checking|looking|searching|on it))\b/i;
-/** Saying it already did something ("I've closed the file") — a lie when no tool ran this turn. */
-const CLAIM =
-  /\b(i'?ve|i have|i)\s+(just\s+|already\s+|now\s+|gone ahead and\s+|went ahead and\s+)?(closed|saved|opened|created|made|moved|renamed|written|wrote|rewritten|rewrote|added|edited|changed|updated|modified|replaced|swapped|switched|converted|turned|inserted|implemented|refactored|corrected|adjusted|reverted|restored|applied|fixed|set|started|stopped|paused|played|locked|sent|drafted|deleted|removed|copied|pasted|typed|clicked|cleared|done|finished|marked|ticked|completed|scheduled|booked|noted|logged|archived|cancell?ed|put|checked off|approved|confirmed|allowed|installed|ran|built|launched|downloaded|uploaded)\b(?!\s+(you|me)\b)|\b(it'?s|it is|that'?s) (now )?(closed|saved|done|created|fixed|added|replaced|marked|ticked off|scheduled|booked|on (your|the) (list|calendar))\b|\b((has|have) been|was|were|got) (created|updated|edited|changed|saved|added|modified|replaced|swapped|switched|converted|rewritten|inserted|fixed|renamed|moved|written|deleted|removed|opened|closed)\b|\bis now (updated|saved|fixed|changed|replaced|printing|set|using)\b|^\s*done\b/i;
-/** Talking about his screen or open windows — the local brain can't see either. */
-const UNSEEN =
-  /\b(on (your|the) screen|(can|can't|cannot|don't|do not) see (any|it|that|the|your|anything|an?)\b|currently open|you have open|(is|are) open (right now|now)?)/i;
-
-/** Asking sir for details ("could you describe the error?", "what would you like me to do?"). */
-const CLARIFY =
-  /\b(could|can|would) you (please )?(provide|describe|confirm|clarify|tell me|check|specify|give|share|explain|paste)\b|\bwhat (errors?|issue|exactly|would you like|do you mean|are you referring)\b[^.?!]*\?/i;
-/** Sir asking about what's on his screen. */
-const SCREEN = /\b(see|look at|check|read|what'?s on|what is on) (my|the) (screen|monitor|display)\b|\bon (my|the) screen\b/i;
-/** Sir asking to hear it again — the only time the same reply twice is right. */
-const ASK_AGAIN = /\b(repeat|again|say that|what did you (just )?say|pardon|come again)\b/i;
-/** The same reply, ignoring case and punctuation. */
-const sameWords = (a: string, b: string) => {
-  const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-  return norm(a) !== "" && norm(a) === norm(b);
-};
 
 /** Adds a system nudge after the brain's last message so the loop runs another round. */
 function pushNudge(messages: Anthropic.Beta.BetaMessageParam[], message: Anthropic.Beta.BetaMessage, note: string) {

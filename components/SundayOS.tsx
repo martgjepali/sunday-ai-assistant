@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, getJSON, type BrainData, type BrainMode, type SystemStatus } from "@/lib/client/api";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { api, getJSON, type BrainData, type BrainMode, type SpendSource, type SystemStatus } from "@/lib/client/api";
 import { useSunday, type ChatEntry, type IdentityState } from "@/lib/client/useSunday";
 import { VoiceEnroll } from "./VoiceEnroll";
 import { BootSequence } from "./BootSequence";
@@ -24,6 +24,30 @@ import { CodingPanel } from "./CodingPanel";
 
 const GROUP_ORDER = ["core", "hub", "skill", "category", "memory", "conversation", "drive", "folder", "app", "mail", "web", "code"];
 
+/** For values that never change after load (like "running in the desktop app"). */
+const noSubscribe = () => () => {};
+
+/** Body or orb, remembered in this browser. Read through useSyncExternalStore so the first render matches the server's. */
+const bodySetting = {
+  subscribe(onChange: () => void) {
+    window.addEventListener("sunday-body", onChange);
+    return () => window.removeEventListener("sunday-body", onChange);
+  },
+  get() {
+    try {
+      return localStorage.getItem("sunday.body") !== "off";
+    } catch {
+      return true;
+    }
+  },
+  set(on: boolean) {
+    try {
+      localStorage.setItem("sunday.body", on ? "on" : "off");
+    } catch {}
+    window.dispatchEvent(new Event("sunday-body"));
+  },
+};
+
 export function SundayOS() {
   const brain = useRef<BrainHandle>(null);
   const [data, setData] = useState<BrainData | null>(null);
@@ -32,14 +56,7 @@ export function SundayOS() {
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [repel, setRepel] = useState(90);
   /** SUNDAY's 3D body in place of the orb — on unless he switched it off. */
-  const [body, setBody] = useState(false);
-  useEffect(() => {
-    try {
-      setBody(localStorage.getItem("sunday.body") !== "off");
-    } catch {
-      setBody(true);
-    }
-  }, []);
+  const body = useSyncExternalStore(bodySetting.subscribe, bodySetting.get, () => false);
   const [linkLength, setLinkLength] = useState(38);
   const [showLabels, setShowLabels] = useState(true);
   const [ambient, setAmbient] = useState(true);
@@ -51,7 +68,7 @@ export function SundayOS() {
   // The WebGL brain is heavy to set up; it starts at the boot's logo reveal so it
   // can't stall the assembly animation, and is ready when the HUD dives into it.
   const [brainOn, setBrainOn] = useState(false);
-  const [isDesktop, setIsDesktop] = useState(false);
+  const isDesktop = useSyncExternalStore(noSubscribe, () => Boolean(window.sundayDesktop), () => false);
 
   const loadBrain = useCallback(async () => {
     try {
@@ -72,8 +89,8 @@ export function SundayOS() {
   });
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a fetch: state is set when it answers, not synchronously
     void loadBrain();
-    setIsDesktop(Boolean(window.sundayDesktop));
   }, [loadBrain]);
 
   const nodeById = useMemo(() => new Map(data?.nodes.map((n) => [n.id, n]) ?? []), [data]);
@@ -179,12 +196,7 @@ export function SundayOS() {
           wakeReady={Boolean(sunday.status?.wake.ready)}
           onToggle={sunday.toggleSession}
           body={body}
-          onBodyChange={(on) => {
-            setBody(on);
-            try {
-              localStorage.setItem("sunday.body", on ? "on" : "off");
-            } catch {}
-          }}
+          onBodyChange={bodySetting.set}
         />
 
         <SystemsPanel
@@ -476,6 +488,18 @@ const BRAIN_MODE_TEXT: Record<BrainMode, string> = {
   deep: "Opus first",
 };
 
+/** What each job is called in the Spend row's breakdown. */
+const SPEND_LABEL: Record<SpendSource, string> = {
+  fast: "Haiku chat",
+  deep: "Opus chat",
+  memory: "Memory",
+  computer: "Computer use",
+  coding: "Coding",
+  diagnostics: "Self-test",
+};
+/** "$0.04", or "<$0.01" for a fraction of a cent. */
+const usd = (n: number) => (n > 0 && n < 0.01 ? "<$0.01" : `$${n.toFixed(2)}`);
+
 function SystemsPanel({
   status,
   isDesktop,
@@ -526,8 +550,17 @@ function SystemsPanel({
         </button>
       ) : undefined,
   };
-  const rows: { name: string; ok: boolean | "partial"; value: string; action?: ReactNode }[] = [
+  const rows: { name: string; ok: boolean | "partial"; value: string; detail?: string; action?: ReactNode }[] = [
     { name: "Core", ok: status.brain, value: status.brain ? `${status.model} · ${status.effort}` : "ANTHROPIC_API_KEY missing" },
+    {
+      name: "Spend",
+      ok: true,
+      value: `${usd(status.spend.today)} today · ${usd(status.spend.month)} this month`,
+      // Hover: this month by job.
+      detail: status.spend.bySource.length
+        ? status.spend.bySource.map((s) => `${SPEND_LABEL[s.source]} ${usd(s.usd)} (${s.calls}×)`).join(" · ")
+        : "Nothing spent on Claude this month",
+    },
     {
       name: "Local brain",
       ok: status.brains.local.ready ? true : "partial",
@@ -593,7 +626,7 @@ function SystemsPanel({
           <li key={r.name}>
             <span className="sys-led" data-ok={String(r.ok)} />
             <span className="sys-name">{r.name}</span>
-            <span className="sys-value" title={r.value}>
+            <span className="sys-value" title={r.detail ?? r.value}>
               {r.value}
             </span>
             {r.action}

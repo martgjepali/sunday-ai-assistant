@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type * as THREE_NS from "three";
+import { useLatest } from "@/lib/client/useLatest";
 import type { VoiceState } from "@/lib/client/useSunday";
 
 /**
@@ -17,8 +18,11 @@ const JAW_MAX = 0.22;
 const JAW_FLOOR = 0.05;
 /** Voice level (0..1) at which her jaw is fully open — ordinary speech sits around 0.2–0.5. */
 const JAW_FULL = 0.5;
-/** The glass over her eyes (pSphere3). */
+/** The glass over her eyes (pSphere3) — its glowing irises dim when she blinks. */
 const EYE_MATERIAL = "material_12";
+const BLINK_MS = 150;
+/** How long she keeps looking toward his mouse after it stops moving. */
+const GAZE_HOLD_MS = 3000;
 
 /** How strongly her cables (red) and eyes / trim (blue) glow in each state. */
 const GLOW: Record<VoiceState, { red: number; blue: number }> = {
@@ -45,12 +49,9 @@ type Props = {
 
 export function Avatar({ state, level, onFail }: Props) {
   const host = useRef<HTMLDivElement>(null);
-  const stateRef = useRef(state);
-  stateRef.current = state;
-  const levelRef = useRef(level);
-  levelRef.current = level;
-  const failRef = useRef(onFail);
-  failRef.current = onFail;
+  const stateRef = useLatest(state);
+  const levelRef = useLatest(level);
+  const failRef = useLatest(onFail);
   const dragged = useRef(false);
   const [ready, setReady] = useState(false);
 
@@ -193,8 +194,17 @@ export function Avatar({ state, level, onFail }: Props) {
         turn = next;
       };
       const onUp = () => (down = null);
+      // Where his mouse is, relative to her face: she looks toward it for a few seconds after it moves.
+      const gaze = { x: 0, y: 0, at: -1e9 };
+      const onLook = (e: PointerEvent) => {
+        const r = el.getBoundingClientRect();
+        gaze.x = Math.max(-1, Math.min(1, (e.clientX - (r.left + r.width / 2)) / (window.innerWidth / 2)));
+        gaze.y = Math.max(-1, Math.min(1, (e.clientY - (r.top + r.height * 0.35)) / (window.innerHeight / 2)));
+        gaze.at = performance.now();
+      };
       el.addEventListener("pointerdown", onDown);
       window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointermove", onLook);
       window.addEventListener("pointerup", onUp);
 
       const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -203,12 +213,39 @@ export function Avatar({ state, level, onFail }: Props) {
       let blue = GLOW.standby.blue;
       let mouth = 0;
       const pose = { nod: 0, turn: 0, tilt: 0 };
+      const look = { x: 0, y: 0, weight: 0 };
+      // Blinks: her glowing irises dim for a moment, every few seconds (sometimes twice).
+      const eyes: { mat: THREE_NS.MeshStandardMaterial; base: number }[] = [];
+      model.traverse((o) => {
+        const mat = (o as THREE_NS.Mesh).material as THREE_NS.MeshStandardMaterial | undefined;
+        if ((o as THREE_NS.Mesh).isMesh && mat?.name === EYE_MATERIAL) eyes.push({ mat, base: mat.emissiveIntensity });
+      });
+      let blinkAt = performance.now() + 2500;
+      let doubleBlink = false;
+      let lastState: VoiceState = stateRef.current;
+      let speakAt = -1e9;
       setReady(true);
 
       const tick = (now: number) => {
         const t = reduce ? 0 : now / 1000;
         const s = stateRef.current;
         const raw = levelRef.current();
+        if (s !== lastState) {
+          if (s === "speaking") speakAt = now;
+          if (s === "listening") blinkAt = Math.min(blinkAt, now); // a blink as she starts to listen
+          lastState = s;
+        }
+
+        // Blink: 150ms down and up; the next one in 2.5–6s, one in five a double.
+        if (!reduce && eyes.length) {
+          const since = now - blinkAt;
+          const shut = since >= 0 && since < BLINK_MS ? Math.sin((since / BLINK_MS) * Math.PI) : 0;
+          for (const e of eyes) e.mat.emissiveIntensity = e.base * (1 - 0.88 * shut);
+          if (since >= BLINK_MS) {
+            doubleBlink = !doubleBlink && Math.random() < 0.2;
+            blinkAt = now + (doubleBlink ? 120 : 2500 + Math.random() * 3500);
+          }
+        }
         smooth += (raw - smooth) * (raw > smooth ? 0.45 : 0.12);
 
         const target = GLOW[s];
@@ -234,8 +271,18 @@ export function Avatar({ state, level, onFail }: Props) {
         const lookTurn = (Math.sin(t * 0.23) * 0.09 + Math.sin(t * 0.61 + 1.3) * 0.035) * idle;
         const lookNod = (Math.sin(t * 0.31 + 0.7) * 0.03 + Math.sin(t * 0.83) * 0.012) * idle;
         const talk = s === "speaking" ? smooth : 0;
-        head.rotation.x = pose.nod + lookNod + talk * 0.07 + Math.sin(t * 2.3) * talk * 0.02;
-        head.rotation.y = pose.turn + lookTurn + (s === "speaking" ? Math.sin(t * 0.9) * 0.05 : 0);
+        // As she starts talking she looks straight at him and gives a small nod, then carries on.
+        const sinceSpeak = (now - speakAt) / 1000;
+        const glance = reduce ? 0 : Math.max(0, 1 - Math.max(0, sinceSpeak - 0.9) / 0.6) * (sinceSpeak >= 0 ? 1 : 0);
+        const greet = sinceSpeak >= 0 && sinceSpeak < 0.7 && !reduce ? Math.sin((sinceSpeak / 0.7) * Math.PI) * 0.06 : 0;
+        // His mouse: she turns toward it for a few seconds after it moves, then drifts back to looking around.
+        const fresh = reduce ? 0 : 1 - Math.min(1, Math.max(0, (now - gaze.at - GAZE_HOLD_MS) / 1500));
+        look.weight += (fresh * (1 - glance) - look.weight) * 0.05;
+        look.x += (gaze.x * 0.38 - look.x) * 0.08;
+        look.y += (gaze.y * 0.16 - look.y) * 0.08;
+        const free = (1 - look.weight) * (1 - glance);
+        head.rotation.x = pose.nod + lookNod * free + look.y * look.weight + greet + talk * 0.07 + Math.sin(t * 2.3) * talk * 0.02;
+        head.rotation.y = pose.turn * (1 - glance) + lookTurn * free + look.x * look.weight + (s === "speaking" ? Math.sin(t * 0.9) * 0.05 * (1 - glance) : 0);
         head.rotation.z = pose.tilt + Math.sin(t * 0.47 + 2.1) * 0.015 * idle + (s === "speaking" ? Math.sin(t * 1.3) * 0.02 : 0);
 
         if (!down) {
@@ -256,6 +303,7 @@ export function Avatar({ state, level, onFail }: Props) {
         ro.disconnect();
         el.removeEventListener("pointerdown", onDown);
         window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointermove", onLook);
         window.removeEventListener("pointerup", onUp);
         scene.traverse((o) => {
           const mesh = o as THREE_NS.Mesh;
@@ -277,7 +325,7 @@ export function Avatar({ state, level, onFail }: Props) {
       cancelAnimationFrame(raf);
       cleanup();
     };
-  }, []);
+  }, [stateRef, levelRef, failRef]); // stable refs — the scene is built once
 
   return (
     <div

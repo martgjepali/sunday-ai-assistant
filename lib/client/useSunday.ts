@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { NotOwnerError, api, getJSON, streamChat, verifyVoice, type SystemStatus } from "./api";
+import { useLatest } from "./useLatest";
 import { BrowserEar, DeepgramEar, Speaker, WakeWord, chime, type Ear } from "./voice";
 
 export type VoiceState = "standby" | "listening" | "thinking" | "speaking";
@@ -57,12 +58,10 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
   const [voiceReplies, setVoiceReplies] = useState(true);
   const [sessionActive, setSessionActive] = useState(false);
 
-  const optsRef = useRef(opts);
-  optsRef.current = opts;
+  const optsRef = useLatest(opts);
   const statusRef = useRef<SystemStatus | null>(null);
   const convRef = useRef<string | null>(null);
-  const voiceRepliesRef = useRef(true);
-  voiceRepliesRef.current = voiceReplies;
+  const voiceRepliesRef = useLatest(voiceReplies);
   const sessionRef = useRef(false);
   const inFlightRef = useRef<AbortController | null>(null);
   /** True while a computer task has the mouse and keyboard. */
@@ -132,11 +131,14 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
   );
 
   const armIdle = useCallback(() => {
-    if (idleRef.current) clearTimeout(idleRef.current);
-    idleRef.current = setTimeout(() => {
-      if (!inFlightRef.current && !speakerRef.current?.speaking) endSessionRef.current();
-      else armIdle();
-    }, IDLE_MS);
+    const arm = () => {
+      if (idleRef.current) clearTimeout(idleRef.current);
+      idleRef.current = setTimeout(() => {
+        if (!inFlightRef.current && !speakerRef.current?.speaking) endSessionRef.current();
+        else arm();
+      }, IDLE_MS);
+    };
+    arm();
   }, []);
 
   const settle = useCallback(() => {
@@ -149,14 +151,14 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     }
   }, [armIdle]);
 
-  // Speaker is created once; it reads live settings through refs.
-  if (!speakerRef.current && typeof window !== "undefined") {
-    speakerRef.current = new Speaker(() => Boolean(statusRef.current && statusRef.current.voice.engine !== "browser"), {
+  // Speaker is created once, before any effect needs it; it reads live settings through refs.
+  useLayoutEffect(() => {
+    speakerRef.current ??= new Speaker(() => Boolean(statusRef.current && statusRef.current.voice.engine !== "browser"), {
       onStart: () => setState("speaking"),
       onIdle: () => settle(),
       onError: (msg) => setNotice(msg),
     });
-  }
+  }, [settle]);
 
   const markInterrupted = () =>
     setEntries((list) => {
@@ -277,7 +279,9 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     if (!lockedRef.current && !pausedRef.current) void wakeRef.current?.resume().catch(() => {});
     if (!inFlightRef.current && !speakerRef.current?.speaking) setState("standby");
   }, []);
-  endSessionRef.current = endSession;
+  useLayoutEffect(() => {
+    endSessionRef.current = endSession;
+  }, [endSession]);
 
   /** Stop all listening (wake word + conversation) until resumed, e.g. during Voice ID enrollment. */
   const pauseListening = useCallback((on: boolean) => {
@@ -396,9 +400,11 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
       if (speak) speakerRef.current?.flush();
       else settle();
     },
-    [refuse, settle],
+    [refuse, settle, optsRef, voiceRepliesRef],
   );
-  sendRef.current = (t, m, token) => void send(t, m, token);
+  useLayoutEffect(() => {
+    sendRef.current = (t, m, token) => void send(t, m, token);
+  }, [send]);
 
   const toggleSession = useCallback(() => {
     if (speakerRef.current?.speaking) {
@@ -486,6 +492,7 @@ export function useSunday(opts: { onActivate: (ids: string[]) => void; onReplyDo
     navigator.mediaDevices?.addEventListener("devicechange", onDevices);
 
     // Windows locked or asleep: drop everything; nothing works until sir unlocks.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a fetch: state is set when it answers, not synchronously
     void loadIdentity();
     const offLock = window.sundayDesktop?.onLock?.(() => {
       lockedRef.current = true;

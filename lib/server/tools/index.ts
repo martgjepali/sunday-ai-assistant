@@ -128,8 +128,17 @@ const TOOLS = [
       limit: z.number().int().min(1).max(100).optional(),
     }),
     run: async ({ query, ...opts }) => {
-      const results = searchIndex(query, opts);
-      return { result: { count: results.length, results }, activate: [] };
+      const { results, close } = searchIndex(query, opts);
+      return {
+        result: {
+          count: results.length,
+          results,
+          ...(close && results.length
+            ? { note: "Nothing matched every word, so these match all but one (sir's words may have been misheard). Check they fit before using one." }
+            : {}),
+        },
+        activate: [],
+      };
     },
   }),
   def({
@@ -1075,7 +1084,8 @@ export function toolSchemas(brain: Brain = "deep", channel: Channel = "pc", abou
       : TOOLS.filter((t) => brain === "deep" || !DEEP_ONLY.has(t.name));
   const offered = chosen.filter((t) => !(channel !== "pc" && REMOTE_BLOCKED.has(t.name)));
   const custom = offered.map((t) => {
-    const { $schema: _ignored, ...schema } = z.toJSONSchema(t.schema) as Record<string, unknown>;
+    const schema = z.toJSONSchema(t.schema) as Record<string, unknown>;
+    delete schema.$schema;
     return {
       name: t.name,
       description: t.description,

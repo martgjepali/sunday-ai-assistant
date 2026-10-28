@@ -52,3 +52,7 @@ next-env.d.ts
 
 # test builds (SUNDAY_DIST_DIR)
 /.next-test/
+
+# Throwaway folder for npm test
+/.sunday-test/
+/.sunday-test-replay/

@@ -24,9 +24,9 @@ const rmsOf = (pcm: Int16Array) => {
 };
 
 const send = (action: string, pcm?: Int16Array) =>
-  fetch(`/api/voiceprint?action=${action}`, {
+  api(`/api/voiceprint?action=${action}`, {
     method: "POST",
-    headers: { "x-sunday-client": "1", "Content-Type": "application/octet-stream" },
+    headers: { "Content-Type": "application/octet-stream" },
     body: pcm ? pcm.slice().buffer : undefined,
   });
 

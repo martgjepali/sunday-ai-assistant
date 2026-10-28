@@ -20,6 +20,7 @@ import {
 } from "./brains";
 import { FAST_MODEL, IMAGE_MAX_USD, IMAGE_MODEL, LOCAL_BASE_MODEL, LOCAL_KEEP_ALIVE, LOCAL_MODEL, MODEL, OLLAMA_URL, driveRoots, features } from "./config";
 import { indexerStatus } from "./indexer";
+import { recordUsage } from "./spend";
 import { ownerVoice, voiceChecks, voiceIdDisabled, voiceThreshold } from "./speaker";
 
 /** "last 12 checks: 10 passed (avg match 0.71, 2 via trust), 2 refused (0.41, 0.38)" */
@@ -180,6 +181,7 @@ async function checkClaude(brain: Brain, model: string, test: boolean, problems:
         output_config: { effort: "low" },
         messages: [{ role: "user", content: "Reply with just: OK" }],
       });
+      recordUsage("diagnostics", r.model, r.usage);
       const text = r.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("").trim();
       out.test = { ok: true, ms: Date.now() - t0, reply: text.slice(0, 40) };
     } catch (err) {

@@ -8,6 +8,7 @@ import { lendGpu, ollamaApi, unloadLocal, warmLocal } from "./brains";
 import { MODEL, OLLAMA_URL } from "./config";
 import { logActivity } from "./db";
 import { pushNotice } from "./notices";
+import { recordCost } from "./spend";
 import { openInVSCode } from "./tools/code";
 import {
   FileToolError,
@@ -229,6 +230,7 @@ function onMessage(s: Session, m: SDKMessage) {
   }
   if (m.type === "result") {
     s.cost = s.local ? 0 : m.total_cost_usd; // the local coder is free whatever the SDK estimates
+    recordCost("coding", s.cost);
     if (m.subtype === "success" && !m.is_error && s.local && !s.files.size && !s.commands && /"name"\s*:\s*"(Write|Edit|Bash|PowerShell|Read)"/.test(m.result)) {
       // It wrote its tool calls out as text instead of making them — nothing actually happened.
       s.status = "failed";

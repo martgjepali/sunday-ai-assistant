@@ -4,7 +4,7 @@ import { api } from "./api";
 
 /* ───────────────────────────── Mouth ─────────────────────────────
  * Speaks streamed text as it arrives. The first sentence is voiced the moment
- * it's complete so SUNDAY starts talking fast; later sentences are merged into
+ * it's complete (a long one from its first pause) so SUNDAY starts talking fast; later sentences are merged into
  * larger chunks while she speaks. At most PREFETCH chunks are being fetched at
  * once, which keeps us under ElevenLabs' per-plan concurrency limit.
  * stop() silences her instantly.
@@ -13,6 +13,23 @@ import { api } from "./api";
 const SENTENCE_END = /[.!?…]+["')\]]*\s+|\n+/;
 const PREFETCH = 2;
 const MIN_CHUNK = 110;
+/** A first sentence longer than this is split, so her first clip is short — the voice takes ~0.5s per second of speech. */
+const OPENING_MAX = 70;
+
+/** "A lovely evening in London is crisp, with…" → ["A lovely evening in London is crisp,", "with…"]: speaks the first pause's worth first. */
+export function splitOpening(sentence: string): [string, string] {
+  if (sentence.length <= OPENING_MAX) return [sentence, ""];
+  const clause = sentence.match(/^(.{15,90}?[,;:—–])\s+(?=\S)/);
+  if (clause && sentence.length - clause[0].length >= 15) return [clause[1], sentence.slice(clause[0].length)];
+  if (sentence.length < 90) return [sentence, ""];
+  // No pause near the start: before a joining word, where a speaker would breathe anyway.
+  const joint = sentence.match(/^(.{25,75}?)\s+(?=(?:and|but|so|for|with|which|that|because|while|then|or|to)\s)/i);
+  if (joint) return [joint[1], sentence.slice(joint[0].length)];
+  // Last resort, only for a really long sentence: a word boundary.
+  if (sentence.length < 140) return [sentence, ""];
+  const at = sentence.lastIndexOf(" ", 60);
+  return at > 25 ? [sentence.slice(0, at), sentence.slice(at + 1)] : [sentence, ""];
+}
 
 type Chunk = { text: string; audio?: Promise<AudioBuffer | null> };
 
@@ -99,7 +116,10 @@ export class Speaker {
   private addSentence(sentence: string) {
     if (!this.firstSent) {
       this.firstSent = true;
-      this.enqueue(sentence);
+      // Both halves go in the queue now, so the second is made while the first plays.
+      const [opening, rest] = splitOpening(sentence);
+      this.enqueue(opening);
+      if (rest) this.enqueue(rest);
       return;
     }
     this.pending = this.pending ? `${this.pending} ${sentence}` : sentence;

@@ -1,5 +1,6 @@
 import "server-only";
 import { existsSync, promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { driveRoots } from "./config";
 import { indexDb, transaction } from "./db";
@@ -47,6 +48,13 @@ const SKIP = new Set(
 
 const MAX_DEPTH = 16;
 const REINDEX_AFTER_MS = 12 * 60 * 60 * 1000;
+/**
+ * Where new things land. A full drive scan runs every 12 hours; these are refreshed every 15 minutes,
+ * so "the file I just saved to my Desktop" can be found.
+ */
+const HOT_FOLDERS = ["Desktop", "Documents", "Downloads", "OneDrive\\Desktop", "OneDrive\\Documents"].map((f) => win.join(os.homedir(), f));
+const HOT_DEPTH = 4;
+const HOT_MAX = 20_000;
 
 type DriveStatus = {
   state: "idle" | "indexing" | "done" | "error";
@@ -72,9 +80,10 @@ export function indexerStatus() {
 }
 
 export function startIndexer() {
-  if (state.timer) return;
+  // SUNDAY_INDEXER=off: test servers with a fresh data folder mustn't start scanning every drive.
+  if (state.timer || process.env.SUNDAY_INDEXER === "off") return;
   const tick = () => void runIndexPass();
-  state.timer = setInterval(tick, 60 * 60 * 1000);
+  state.timer = setInterval(tick, 15 * 60 * 1000);
   state.timer.unref?.();
   setTimeout(tick, 5000).unref?.();
 }
@@ -88,6 +97,7 @@ async function runIndexPass(force = false) {
       if (!force && saved && Date.now() - saved.finishedAt < REINDEX_AFTER_MS) continue;
       await indexDrive(root);
     }
+    await refreshHotFolders();
   } finally {
     state.running = false;
   }
@@ -153,6 +163,46 @@ async function indexDrive(root: string) {
   }
 }
 
+/** Desktop, Documents and Downloads, re-read so his newest files can be found. */
+export async function refreshHotFolders() {
+  for (const dir of HOT_FOLDERS) if (existsSync(dir)) await indexFolder(dir);
+}
+
+/** Re-reads one folder (a few levels deep) and swaps its rows in the index — quick, unlike a drive scan. */
+async function indexFolder(top: string) {
+  const root = win.parse(top).root.toUpperCase();
+  const rows: [name: string, path: string, ext: string, isDir: number][] = [];
+  const stack: [string, number][] = [[top, 0]];
+  while (stack.length && rows.length < HOT_MAX) {
+    const [dir, depth] = stack.pop()!;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const lower = e.name.toLowerCase();
+      if (e.isSymbolicLink()) continue;
+      const full = win.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (SKIP.has(lower) || lower.startsWith("$")) continue;
+        rows.push([e.name, full, "", 1]);
+        if (depth < HOT_DEPTH) stack.push([full, depth + 1]);
+      } else if (e.isFile()) rows.push([e.name, full, win.extname(lower).slice(1), 0]);
+    }
+  }
+  // A capped walk saw only part of the folder — keep the old rows rather than lose the rest.
+  if (rows.length >= HOT_MAX) return;
+  const db = indexDb();
+  const insert = db.prepare("INSERT INTO files_fts(name, path, drive, ext, size, mtime, is_dir, gen) VALUES (?, ?, ?, ?, 0, 0, ?, 0)");
+  transaction(() => {
+    // substr, not LIKE: folder names can contain _ and %.
+    db.prepare("DELETE FROM files_fts WHERE drive = ? AND substr(path, 1, ?) = ?").run(root, top.length + 1, `${top}\\`);
+    for (const r of rows) insert.run(r[0], r[1], root, r[2], r[3]);
+  }, db);
+}
+
 /** Add a single path to the index right away (after SUNDAY creates or moves something). */
 export function indexPath(p: string, isDir: boolean) {
   const root = win.parse(p).root.toUpperCase();
@@ -178,11 +228,34 @@ export function searchIndex(query: string, opts: SearchOptions = {}) {
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .slice(0, 8);
+  const exact = runSearch(terms.map(nameTerm).join(" AND "), opts, limit);
+  // Nothing? Speech-to-text mishears a word now and then ("project tool" for "project two") — allow one to miss.
+  if (exact.length || terms.length < 3) return { results: exact, close: false };
+  const loose = terms.map((_, skip) => `(${terms.filter((_, i) => i !== skip).map(nameTerm).join(" AND ")})`).join(" OR ");
+  return { results: runSearch(loose, opts, limit), close: true };
+}
+
+/** Spoken numbers arrive as words: "project two" must find "Project 2", and "2" must find "two". */
+const NUMBERS = new Map<string, string>(
+  [
+    ..."zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+      .split(" ")
+      .map((w, n) => [w, String(n)]),
+    ...["thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"].map((w, i) => [w, String(30 + i * 10)]),
+  ].flatMap(([w, n]) => [[w, n], [n, w]] as [string, string][]),
+);
+
+function nameTerm(t: string) {
+  const other = NUMBERS.get(t);
+  return other ? `("${t}"* OR "${other}")` : `"${t}"*`;
+}
+
+function runSearch(match: string, opts: SearchOptions, limit: number) {
   const where: string[] = [];
   const params: (string | number)[] = [];
-  if (terms.length) {
+  if (match) {
     where.push("files_fts MATCH ?");
-    params.push(`name : (${terms.map((t) => `"${t}"*`).join(" AND ")})`);
+    params.push(`name : (${match})`);
   }
   if (opts.drive) {
     where.push("drive = ?");
@@ -199,7 +272,7 @@ export function searchIndex(query: string, opts: SearchOptions = {}) {
   const rows = indexDb()
     .prepare(
       `SELECT name, path, is_dir FROM files_fts WHERE ${where.join(" AND ")} ${
-        terms.length ? "ORDER BY rank" : ""
+        match ? "ORDER BY rank" : ""
       } LIMIT ?`,
     )
     .all(...params, limit * 3) as { name: string; path: string; is_dir: number }[];

@@ -201,6 +201,8 @@ export const Brain3D = forwardRef<BrainHandle, Props>(function Brain3D(props, re
     let raf = 0;
     let ambientTimer: ReturnType<typeof setTimeout> | undefined;
     let resizeObs: ResizeObserver | undefined;
+    // The node map lives for the component's whole life; the cleanup clears this same one.
+    const nodeVisuals = visuals.current;
 
     (async () => {
       const [{ default: ForceGraph3D }, THREE, { default: SpriteText }] = await Promise.all([
@@ -364,7 +366,7 @@ export const Brain3D = forwardRef<BrainHandle, Props>(function Brain3D(props, re
       resizeObs?.disconnect();
       graphRef.current?._destructor();
       graphRef.current = null;
-      visuals.current.clear();
+      nodeVisuals.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

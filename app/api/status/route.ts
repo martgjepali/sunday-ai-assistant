@@ -2,6 +2,7 @@ import { connection } from "next/server";
 import { brainMode, localBrainStatus } from "@/lib/server/brains";
 import { EFFORT, FAST_MODEL, LOCAL_BASE_MODEL, MODEL, driveRoots, features } from "@/lib/server/config";
 import { indexerStatus } from "@/lib/server/indexer";
+import { spendSummary } from "@/lib/server/spend";
 import { gmailAccount } from "@/lib/server/tools/gmail";
 import { calendarReady } from "@/lib/server/calendar";
 import { telegramStatus } from "@/lib/server/telegram";
@@ -23,5 +24,6 @@ export async function GET() {
     typesafe: typesafeEnabled(),
     gmail: { configured: features.google(), account: gmailAccount(), calendar: calendarReady() },
     telegram: telegramStatus(),
+    spend: spendSummary(),
   });
 }

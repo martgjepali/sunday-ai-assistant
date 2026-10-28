@@ -11,7 +11,9 @@
     "desktop": "electron .",
     "desktop:dev": "electron . --dev",
     "lint": "eslint",
-    "shortcuts": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-shortcuts.ps1"
+    "shortcuts": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-shortcuts.ps1",
+    "test": "npx tsx --conditions=react-server --test tests/unit.test.mts",
+    "test:replay": "node tests/run-replay.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.311",

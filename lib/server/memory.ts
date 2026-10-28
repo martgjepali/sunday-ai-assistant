@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { MEMORY_MODEL, supportsFallbacks } from "./config";
 import { db, ftsQuery } from "./db";
+import { recordUsage } from "./spend";
 
 export const MEMORY_CATEGORIES = [
   "identity",
@@ -259,6 +260,7 @@ export async function reflectOnExchange(conversationId: string, userText: string
     ],
   });
 
+  recordUsage("memory", response.model, response.usage);
   if (response.stop_reason === "refusal" || !response.parsed_output) return;
   const { title, memories } = response.parsed_output;
   if (title && !convo?.title) {

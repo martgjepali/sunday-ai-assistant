@@ -6,6 +6,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { DATA_DIR, MODEL } from "./config";
 import { logActivity } from "./db";
+import { recordUsage } from "./spend";
 import type { ToolContext, ToolOutcome } from "./tools";
 import { powershell } from "./tools/system";
 
@@ -440,6 +441,7 @@ export async function computerTask(input: { goal: string; approvedStep?: string 
         }
         throw err;
       }
+      recordUsage("computer", res.model, res.usage);
       const text = res.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("\n").trim();
       if (text) finalText = text;
       const uses = res.content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");

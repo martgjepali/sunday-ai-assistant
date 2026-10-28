@@ -54,7 +54,8 @@ const clock = (ms: number) => {
 export function CodingPanel() {
   const [c, setC] = useState<Coding>({ active: false });
   const [small, setSmall] = useState(false);
-  const [, tick] = useState(0);
+  /** The clock for "running for 2:15", ticked each second while a task runs (0 until the first tick: the page is pre-rendered). */
+  const [now, setNow] = useState(0);
   const running = c.active && (c.status === "working" || c.status === "starting" || c.status === "waiting");
 
   useEffect(() => {
@@ -69,14 +70,16 @@ export function CodingPanel() {
   }, [running]);
   useEffect(() => {
     if (!running) return;
-    const t = setInterval(() => tick((n) => n + 1), 1000);
+    const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, [running]);
-  // A new approval request always opens the panel.
+  // A new approval request always opens the panel (adjusted during render, as React recommends).
   const waiting = c.active && c.status === "waiting";
-  useEffect(() => {
+  const [wasWaiting, setWasWaiting] = useState(waiting);
+  if (waiting !== wasWaiting) {
+    setWasWaiting(waiting);
     if (waiting) setSmall(false);
-  }, [waiting]);
+  }
 
   if (!c.active) return null;
   const act = (action: string) =>
@@ -85,7 +88,7 @@ export function CodingPanel() {
       .then((r: Coding) => "active" in r && setC(r))
       .catch(() => {});
   const done = c.todos.filter((t) => t.status === "completed").length;
-  const elapsed = clock((c.finishedAt ?? Date.now()) - c.startedAt);
+  const elapsed = clock((c.finishedAt ?? Math.max(now, c.startedAt)) - c.startedAt);
 
   if (small) {
     return (

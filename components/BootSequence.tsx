@@ -1,7 +1,8 @@
 "use client";
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { SystemStatus } from "@/lib/client/api";
+import { useLatest } from "@/lib/client/useLatest";
 
 /**
  * SUNDAY's power-on sequence, in the spirit of a Stark HUD: the emblem is
@@ -25,6 +26,9 @@ const WORD = "SUNDAY".split("");
 const EASE_LOCK = "cubic-bezier(0.2, 0.9, 0.25, 1.18)"; // fast in, tiny overshoot: a mechanical "clunk"
 const EASE_OUT = "cubic-bezier(0.23, 1, 0.32, 1)";
 const EASE_IN_OUT = "cubic-bezier(0.77, 0, 0.175, 1)";
+
+/** The reduced-motion setting is read once per boot — no need to listen for changes. */
+const noSubscribe = () => () => {};
 
 const rad = (deg: number) => ((deg - 90) * Math.PI) / 180;
 const polar = (r: number, deg: number) => [Math.cos(rad(deg)) * r, Math.sin(rad(deg)) * r] as const;
@@ -58,12 +62,16 @@ type Props = { status: SystemStatus | null; nodes: number; onReveal?: () => void
 export function BootSequence({ status, nodes, onReveal, onDone }: Props) {
   const root = useRef<HTMLDivElement>(null);
   const svg = useRef<SVGSVGElement>(null);
-  const [progress, setProgress] = useState(0);
-  const [lines, setLines] = useState(0);
-  const doneRef = useRef(onDone);
-  doneRef.current = onDone;
-  const revealRef = useRef(onReveal);
-  revealRef.current = onReveal;
+  const [counted, setProgress] = useState(0);
+  const [typed, setLines] = useState(0);
+  /** Reduced motion: no counting or typing — everything shows at once. */
+  const still = useSyncExternalStore(
+    noSubscribe,
+    () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    () => false,
+  );
+  const doneRef = useLatest(onDone);
+  const revealRef = useLatest(onReveal);
   const finished = useRef(false);
 
   const readouts: [string, string][] = [
@@ -74,6 +82,8 @@ export function BootSequence({ status, nodes, onReveal, onDone }: Props) {
     ["INSTINCT", status ? (status.typesafe ? "JEV ONLINE" : "STANDBY") : "…"],
     ["DRIVES", status ? status.drives.map((d) => d.slice(0, 2)).join(" ") : "…"],
   ];
+  const lines = still ? readouts.length : typed;
+  const progress = still ? 100 : counted;
 
   // Layout effect: animations are set up before first paint, so parts never flash in place.
   useLayoutEffect(() => {
@@ -101,8 +111,7 @@ export function BootSequence({ status, nodes, onReveal, onDone }: Props) {
     };
 
     if (reduce) {
-      setLines(readouts.length);
-      setProgress(100);
+      // All readouts and 100% are shown straight away (see `still` below).
       revealRef.current?.();
       play(s, [{ opacity: 0 }, { opacity: 1 }], { duration: 400 });
       const logo = s.querySelector("[data-logo]");

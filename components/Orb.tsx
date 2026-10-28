@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { useLatest } from "@/lib/client/useLatest";
 import type { VoiceState } from "@/lib/client/useSunday";
 import { Avatar } from "./Avatar";
 
@@ -31,10 +32,8 @@ type Props = {
 
 export function Orb({ state, level, model, wakeReady, onToggle, body, onBodyChange }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
-  const stateRef = useRef(state);
-  stateRef.current = state;
-  const levelRef = useRef(level);
-  levelRef.current = level;
+  const stateRef = useLatest(state);
+  const levelRef = useLatest(level);
 
   useEffect(() => {
     if (body) return;
@@ -148,7 +147,7 @@ export function Orb({ state, level, model, wakeReady, onToggle, body, onBodyChan
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [body]);
+  }, [body, stateRef, levelRef]);
 
   return (
     <div className="orb" data-body={body || undefined}>

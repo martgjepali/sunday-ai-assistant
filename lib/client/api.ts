@@ -1,6 +1,7 @@
 import type { AgentEvent } from "@/lib/server/agent";
+import type { SpendSource } from "@/lib/server/spend";
 
-export type { AgentEvent };
+export type { AgentEvent, SpendSource };
 
 export function api(path: string, init: RequestInit = {}) {
   return fetch(path, {
@@ -107,6 +108,8 @@ export type SystemStatus = {
   typesafe: boolean;
   gmail: { configured: boolean; account: string | null; calendar: boolean };
   telegram: { configured: boolean; bot: string | null; paired: string | null; error: string | null };
+  /** Claude spend in US$, from each reply's real token counts. */
+  spend: { today: number; month: number; bySource: { source: SpendSource; usd: number; calls: number }[] };
 };
 
 export type BrainData = {

@@ -13,7 +13,12 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Third-party skill scripts, not SUNDAY's code.
+    ".claude/**",
+    ".aider-desk/**",
   ]),
+  // Electron's main process is CommonJS: require() is how those files load modules.
+  { files: ["**/*.cjs"], rules: { "@typescript-eslint/no-require-imports": "off" } },
 ]);
 
 export default eslintConfig;
